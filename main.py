@@ -449,26 +449,20 @@ async def get_db():
 
 async def ensure_indexes():
     db = config.db
-    # Proxies collection indexes
+    # Proxies collection indexes (no unique host:port index)
     await db.proxies.create_index([("state", 1), ("quarantine_until", 1)])
     await db.proxies.create_index([("country_code", 1), ("youtube_score", -1)])
-    await db.proxies.create_index([("host", 1), ("port", 1)], unique=True)  # fallback
+    await db.proxies.create_index([("host", 1), ("port", 1)])   # non-unique
     await db.proxies.create_index([("last_seen_at", -1)])
     await db.proxies.create_index([("source_id", 1)])
-    # Sources
+    # ... rest of indexes remain unchanged
     await db.proxy_sources.create_index("source_id", unique=True)
-    # Snapshots
     await db.source_snapshots.create_index([("source_id", 1), ("fetched_at", -1)])
-    # Tasks
     await db.task_runs.create_index("task_id", unique=True)
     await db.task_runs.create_index([("status", 1), ("started_at", -1)])
-    # Events
     await db.proxy_events.create_index([("proxy_id", 1), ("created_at", -1)])
-    # Settings
     await db.worker_settings.create_index("key", unique=True)
-    # Worker state
     await db.worker_state.create_index("key", unique=True)
-    # Feedback
     await db.proxy_feedback.create_index([("proxy_id", 1), ("created_at", -1)])
 
 
