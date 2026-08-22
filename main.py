@@ -470,93 +470,95 @@ async def ensure_indexes():
 # ======================================================================
 # PROXY REPOSITORY
 # ======================================================================
-async def upsert_new_proxy(self, normalized: Dict[str, Any], source_id: str,
-                           source_country: Optional[str] = None,
-                           source_protocol: Optional[str] = None) -> Tuple[str, bool]:
-    """
-    Insert a new proxy if not exists. Returns (proxy_id, is_new).
-    """
-    proxy_id = generate_proxy_id(normalized)
-    existing = await self.proxies.find_one({"_id": proxy_id})
-    if existing:
-        # Update last_seen and source info, and ensure proxy_id field is set
-        update_fields = {
-            "$set": {
-                "last_seen_at": utcnow(),
-                "source_id": source_id,
-                "source_country": source_country if source_country else existing.get("source_country"),
-                "source_protocol": source_protocol if source_protocol else existing.get("source_protocol"),
-                "source_missing": False,
-            }
-        }
-        # If existing doc lacks proxy_id, set it to the same as _id
-        if not existing.get("proxy_id"):
-            update_fields["$set"]["proxy_id"] = proxy_id
-        await self.proxies.update_one({"_id": proxy_id}, update_fields)
-        return proxy_id, False
+class ProxyRepository:
+    """Handles database operations for proxies."""
+    def __init__(self, db):
+        self.db = db
+        self.proxies = db.proxies
 
-    now = utcnow()
-    doc = {
-        "_id": proxy_id,
-        "proxy_id": proxy_id,          # <-- ADD THIS LINE
-        "scheme": normalized["scheme"],
-        "host": normalized["host"],
-        "port": normalized["port"],
-        "username": normalized.get("username"),
-        "password": normalized.get("password"),
-        "state": ProxyState.UNTESTED,
-        "created_at": now,
-        "last_seen_at": now,
-        "source_id": source_id,
-        "source_country": source_country,
-        "source_protocol": source_protocol or normalized["scheme"],
-        "country_code": None,
-        "country_name": None,
-        "country_source": None,
-        "country_verified_at": None,
-        "generic_health": None,
-        "youtube_health": None,
-        "youtube_score": 0.0,
-        "youtube_success_count": 0,
-        "youtube_failure_count": 0,
-        "youtube_consecutive_failures": 0,
-        "youtube_last_success_at": None,
-        "youtube_last_failure_at": None,
-        "youtube_banned_until": None,
-        "quarantine_until": None,
-        "latency_ms": None,
-        "last_test_duration": None,
-        "formats_found": None,
-        "tested_at": None,
-        "yt_dlp_version": None,
-        "test_engine_version": config.TEST_ENGINE_VERSION,
-        "enabled": True,
-        "source_missing": False,
-        "retired_at": None,
-        "retirement_reason": None,
-        "last_activity_at": now,
-    }
-    try:
-        await self.proxies.insert_one(doc)
-        return proxy_id, True
-    except Exception as e:
-        logger.error(f"Failed to insert proxy {proxy_id}: {e}")
-        # Race condition: another inserted? Try again find
+    async def upsert_new_proxy(self, normalized: Dict[str, Any], source_id: str,
+                               source_country: Optional[str] = None,
+                               source_protocol: Optional[str] = None) -> Tuple[str, bool]:
+        """
+        Insert a new proxy if not exists. Returns (proxy_id, is_new).
+        """
+        proxy_id = generate_proxy_id(normalized)
         existing = await self.proxies.find_one({"_id": proxy_id})
         if existing:
-            # Ensure proxy_id is set on existing doc
+            update_fields = {
+                "$set": {
+                    "last_seen_at": utcnow(),
+                    "source_id": source_id,
+                    "source_country": source_country if source_country else existing.get("source_country"),
+                    "source_protocol": source_protocol if source_protocol else existing.get("source_protocol"),
+                    "source_missing": False,
+                }
+            }
             if not existing.get("proxy_id"):
-                await self.proxies.update_one(
-                    {"_id": proxy_id},
-                    {"$set": {"proxy_id": proxy_id, "last_seen_at": utcnow(), "source_missing": False}}
-                )
-            else:
-                await self.proxies.update_one(
-                    {"_id": proxy_id},
-                    {"$set": {"last_seen_at": utcnow(), "source_missing": False}}
-                )
+                update_fields["$set"]["proxy_id"] = proxy_id
+            await self.proxies.update_one({"_id": proxy_id}, update_fields)
             return proxy_id, False
-        raise
+
+        now = utcnow()
+        doc = {
+            "_id": proxy_id,
+            "proxy_id": proxy_id,          # <-- important for unique index
+            "scheme": normalized["scheme"],
+            "host": normalized["host"],
+            "port": normalized["port"],
+            "username": normalized.get("username"),
+            "password": normalized.get("password"),
+            "state": ProxyState.UNTESTED,
+            "created_at": now,
+            "last_seen_at": now,
+            "source_id": source_id,
+            "source_country": source_country,
+            "source_protocol": source_protocol or normalized["scheme"],
+            "country_code": None,
+            "country_name": None,
+            "country_source": None,
+            "country_verified_at": None,
+            "generic_health": None,
+            "youtube_health": None,
+            "youtube_score": 0.0,
+            "youtube_success_count": 0,
+            "youtube_failure_count": 0,
+            "youtube_consecutive_failures": 0,
+            "youtube_last_success_at": None,
+            "youtube_last_failure_at": None,
+            "youtube_banned_until": None,
+            "quarantine_until": None,
+            "latency_ms": None,
+            "last_test_duration": None,
+            "formats_found": None,
+            "tested_at": None,
+            "yt_dlp_version": None,
+            "test_engine_version": config.TEST_ENGINE_VERSION,
+            "enabled": True,
+            "source_missing": False,
+            "retired_at": None,
+            "retirement_reason": None,
+            "last_activity_at": now,
+        }
+        try:
+            await self.proxies.insert_one(doc)
+            return proxy_id, True
+        except Exception as e:
+            logger.error(f"Failed to insert proxy {proxy_id}: {e}")
+            existing = await self.proxies.find_one({"_id": proxy_id})
+            if existing:
+                if not existing.get("proxy_id"):
+                    await self.proxies.update_one(
+                        {"_id": proxy_id},
+                        {"$set": {"proxy_id": proxy_id, "last_seen_at": utcnow(), "source_missing": False}}
+                    )
+                else:
+                    await self.proxies.update_one(
+                        {"_id": proxy_id},
+                        {"$set": {"last_seen_at": utcnow(), "source_missing": False}}
+                    )
+                return proxy_id, False
+            raise
 
     async def get_proxy_by_id(self, proxy_id: str) -> Optional[Dict]:
         return await self.proxies.find_one({"_id": proxy_id})
@@ -578,7 +580,7 @@ async def upsert_new_proxy(self, normalized: Dict[str, Any], source_id: str,
             {
                 "$set": {
                     "state": ProxyState.TESTING,
-                    "testing_lease_until": now + timedelta(seconds=120),  # 2 min lease
+                    "testing_lease_until": now + timedelta(seconds=120),
                     "testing_by": "worker",
                     "testing_started_at": now,
                 }
@@ -605,7 +607,6 @@ async def upsert_new_proxy(self, normalized: Dict[str, Any], source_id: str,
                                        yt_dlp_version: Optional[str] = None,
                                        error_category: Optional[str] = None,
                                        error_details: Optional[str] = None):
-        """Update proxy after a test attempt."""
         now = utcnow()
         update = {
             "$set": {
@@ -641,15 +642,13 @@ async def upsert_new_proxy(self, normalized: Dict[str, Any], source_id: str,
         if error_category:
             update["$set"]["last_error_category"] = error_category
         if error_details:
-            update["$set"]["last_error_details"] = error_details[:500]  # limit
+            update["$set"]["last_error_details"] = error_details[:500]
 
-        # Scoring and counters based on result
         if state == ProxyState.YOUTUBE_WORKING:
             update["$inc"]["youtube_success_count"] = 1
             update["$set"]["youtube_consecutive_failures"] = 0
             update["$set"]["youtube_last_success_at"] = now
             update["$set"]["youtube_banned_until"] = None
-            # Score boost
             update["$inc"]["youtube_score"] = 10.0
         elif state in [ProxyState.YOUTUBE_REJECTED, ProxyState.TIMEOUT, ProxyState.CONNECTION_FAILED]:
             update["$inc"]["youtube_failure_count"] = 1
@@ -657,7 +656,6 @@ async def upsert_new_proxy(self, normalized: Dict[str, Any], source_id: str,
             update["$set"]["youtube_last_failure_at"] = now
             update["$inc"]["youtube_score"] = -5.0
             if state == ProxyState.YOUTUBE_REJECTED:
-                # Quarantine maybe
                 quarantine_hours = config.PROXY_QUARANTINE_HOURS
                 quarantine_until = now + timedelta(hours=quarantine_hours)
                 update["$set"]["quarantine_until"] = quarantine_until
@@ -673,7 +671,6 @@ async def upsert_new_proxy(self, normalized: Dict[str, Any], source_id: str,
             )
 
     async def retire_missing_proxies(self, older_than_hours: int = 24):
-        """Retire proxies that have been source_missing for too long."""
         threshold = utcnow() - timedelta(hours=older_than_hours)
         result = await self.proxies.update_many(
             {"source_missing": True, "last_seen_at": {"$lt": threshold}, "state": {"$ne": ProxyState.RETIRED}},
@@ -713,7 +710,6 @@ async def upsert_new_proxy(self, normalized: Dict[str, Any], source_id: str,
         retired = state_counts.get(ProxyState.RETIRED, 0)
         disabled = state_counts.get(ProxyState.DISABLED, 0)
 
-        # country stats
         country_pipeline = [
             {"$match": {"country_code": {"$ne": None}}},
             {"$group": {"_id": "$country_code", "count": {"$sum": 1},
@@ -792,7 +788,6 @@ async def upsert_new_proxy(self, normalized: Dict[str, Any], source_id: str,
             "created_at": utcnow(),
         }
         await config.db.proxy_feedback.insert_one(doc)
-        # Update proxy counters
         if success:
             await self.proxies.update_one(
                 {"_id": proxy_id},
