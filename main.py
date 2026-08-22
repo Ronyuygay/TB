@@ -12,6 +12,7 @@ Author: Production Engineering
 
 import asyncio
 import aiohttp
+import aiohttp.web
 import asyncio.subprocess
 import base64
 import csv
@@ -2327,8 +2328,6 @@ async def main():
 
 
 if __name__ == "__main__":
-    # Handle signals for graceful shutdown
-    loop = asyncio.get_event_loop()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
