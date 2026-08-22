@@ -44,7 +44,7 @@ logger = logging.getLogger("ProxyWorker")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 MONGO_URI = os.getenv("MONGO_URI")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "telegram_downloader")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "YouTubeDownloader")
 PORT = int(os.getenv("PORT", "8080"))
 
 if not all([BOT_TOKEN, OWNER_ID, MONGO_URI]):
