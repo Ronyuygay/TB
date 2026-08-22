@@ -22,6 +22,7 @@ from typing import List, Dict, Any, Tuple, Optional
 
 # Async Network & Database
 import aiohttp
+from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import UpdateOne, IndexModel, ASCENDING, DESCENDING
 from pymongo.errors import BulkWriteError, ConnectionFailure
@@ -44,7 +45,7 @@ logger = logging.getLogger("ProxyWorker")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 MONGO_URI = os.getenv("MONGO_URI")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "YouTubeDownloader")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "telegram_downloader")
 PORT = int(os.getenv("PORT", "8080"))
 
 if not all([BOT_TOKEN, OWNER_ID, MONGO_URI]):
@@ -810,12 +811,13 @@ async def handle_document(message: Message):
     except Exception as e:
         await bot.send_message(message.chat.id, f"❌ File processing failed: {e}")
 
+
 # ==============================================================================
 # HTTP HEALTH SERVER
 # ==============================================================================
 async def health_handler(request):
     try:
-        # Check DB
+        # Check DB connection
         await db_manager.client.admin.command('ping')
         queue_size = await db_manager.proxies.count_documents({"youtube_state": ProxyState.UNTESTED})
         working_size = await db_manager.proxies.count_documents({"youtube_state": ProxyState.YOUTUBE_WORKING})
@@ -829,18 +831,18 @@ async def health_handler(request):
             "circuit_breaker": "active" if scheduler.circuit_breaker_active_until and get_now() < scheduler.circuit_breaker_active_until else "inactive",
             "timestamp": get_now().isoformat()
         }
-        return aiohttp.web.json_response(data, status=200)
+        return web.json_response(data, status=200)
     except Exception as e:
-        return aiohttp.web.json_response({"status": "error", "message": str(e)}, status=503)
+        return web.json_response({"status": "error", "message": str(e)}, status=503)
 
 async def start_web_server():
-    app = aiohttp.web.Application()
+    app = web.Application()
     app.router.add_get("/health", health_handler)
     app.router.add_get("/", health_handler)
     
-    runner = aiohttp.web.AppRunner(app)
+    runner = web.AppRunner(app)
     await runner.setup()
-    site = aiohttp.web.TCPSite(runner, '0.0.0.0', PORT)
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     logger.info(f"Health server listening on 0.0.0.0:{PORT}")
 
