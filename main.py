@@ -605,18 +605,43 @@ db_manager = DatabaseManager(MONGO_URI, MONGO_DB_NAME)
 source_manager = SourceManager(db_manager)
 scheduler = WorkerScheduler(db_manager, bot)
 
-# Owner authorization middleware
-@bot.middleware_handler(update_types=['message'])
-async def check_owner_message(bot_instance, message: Message):
-    if message.from_user.id != OWNER_ID:
-        logger.warning(f"Unauthorized access attempt from {message.from_user.id}")
-        return Exception("Unauthorized") # Blocks execution
+from telebot.asyncio_handler_backends import BaseMiddleware, CancelUpdate
 
-@bot.middleware_handler(update_types=['callback_query'])
-async def check_owner_callback(bot_instance, call: CallbackQuery):
-    if call.from_user.id != OWNER_ID:
-        await bot.answer_callback_query(call.id, "⛔ Unauthorized.")
-        return Exception("Unauthorized")
+# Owner authorization middleware using BaseMiddleware class
+class OwnerOnlyMiddleware(BaseMiddleware):
+    def __init__(self, owner_id: int):
+        super().__init__()
+        self.owner_id = owner_id
+        # Apply this middleware to both messages and inline button clicks
+        self.update_types = ['message', 'callback_query']
+
+    async def pre_process(self, message, data):
+        user_id = None
+        
+        # Check if the update contains user information
+        if hasattr(message, 'from_user') and message.from_user:
+            user_id = message.from_user.id
+        
+        # Block if the user is not the owner
+        if user_id != self.owner_id:
+            logger.warning(f"Unauthorized access attempt from User ID: {user_id}")
+            
+            # If it's a callback query (inline button click), send an alert
+            if hasattr(message, 'data'):
+                try:
+                    await bot.answer_callback_query(message.id, "⛔ Unauthorized.")
+                except Exception:
+                    pass
+                    
+            # This completely stops the bot from processing the message
+            return CancelUpdate()
+
+    async def post_process(self, message, data, exception):
+        # We don't need to do anything after processing
+        pass
+
+# Setup the middleware into the bot
+bot.setup_middleware(OwnerOnlyMiddleware(OWNER_ID))
 
 def get_main_keyboard():
     markup = InlineKeyboardMarkup(row_width=2)
