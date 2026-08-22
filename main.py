@@ -2296,10 +2296,9 @@ class ProxyWorkerBot:
                 await asyncio.sleep(3600)
 
     async def run(self):
-    """Run the bot main loop."""
-    await self.initialize()
-    # Use infinity_polling for better resilience against conflicts
-    await self.bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        await self.initialize()
+        # Use infinity_polling for better resilience against conflicts
+        await self.bot.infinity_polling(timeout=10, long_polling_timeout=5)
 
     async def shutdown(self, sig=None):
         """Graceful shutdown."""
