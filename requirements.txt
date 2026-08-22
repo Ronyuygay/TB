@@ -1,0 +1,13 @@
+# MongoDB Async Driver (includes pymongo)
+motor==3.6.0
+pymongo==4.10.1
+dnspython==2.7.0
+
+# Telegram API
+pyTelegramBotAPI==4.26.0
+
+# Async Web & HTTP Client
+aiohttp==3.11.11
+
+# YouTube Extraction
+yt-dlp==2024.12.13
