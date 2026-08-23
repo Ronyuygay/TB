@@ -1467,8 +1467,12 @@ class WorkerScheduler:
             )
             if not claimed:
                 return
-            logger.info(f"[TEST] proxy_id={proxy_id} start")
+            
+            # Changed to logger.debug to avoid log spamming on deployment platforms
+            logger.debug(f"[TEST] proxy_id={proxy_id} start")
+            
             result = await self.tester.full_test_proxy(claimed)
+            
             # Update DB
             await self.tester.repo.update_proxy_test_result(
                 proxy_id,
@@ -1486,7 +1490,9 @@ class WorkerScheduler:
                 error_category=result.get("youtube_result"),
                 error_details=result.get("youtube_error"),
             )
-            logger.info(f"[TEST] proxy_id={proxy_id} result={result['final_state']}")
+            
+            # Changed to logger.debug to avoid log spamming on deployment platforms
+            logger.debug(f"[TEST] proxy_id={proxy_id} result={result['final_state']}")
 
     async def enqueue_proxy_test(self, proxy_id: str):
         try:
