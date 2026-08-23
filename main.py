@@ -879,6 +879,11 @@ class ProxySourceManager:
     async def fetch_source_content(self, source: Dict) -> Tuple[Optional[str], Optional[str]]:
         """Fetch content of a source. Returns (content, error)."""
         url = source["url"]
+        
+        # Automatically convert GitHub blob URLs to raw URLs for proper text extraction
+        if "github.com" in url and "/blob/" in url:
+            url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+
         try:
             async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 if resp.status != 200:
@@ -2147,8 +2152,12 @@ class HealthServer:
         self.setup_routes()
 
     def setup_routes(self):
+        self.app.router.add_get("/", self.root_handler)
         self.app.router.add_get("/health", self.health_handler)
         self.app.router.add_get("/ready", self.ready_handler)
+
+    async def root_handler(self, request):
+        return aiohttp.web.Response(text="Proxy Worker Bot is running smoothly.")
 
     async def health_handler(self, request):
         mongo_ok = await self.check_mongo()
