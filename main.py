@@ -225,7 +225,12 @@ VALID_TRANSITIONS = {
 # UTILITY FUNCTIONS
 # ======================================================================
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    """
+    Return a naive datetime object representing the current time in UTC.
+    This prevents offset-naive vs offset-aware conflicts when comparing 
+    dates fetched from MongoDB.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def normalize_proxy_string(proxy_str: str) -> Optional[Dict[str, Any]]:
@@ -2293,7 +2298,8 @@ class ProxyWorkerBot:
     async def run(self):
         await self.initialize()
         # Use infinity_polling for better resilience against conflicts
-        await self.bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        # Removed unsupported 'long_polling_timeout' argument
+        await self.bot.infinity_polling(timeout=10)
 
     async def shutdown(self, sig=None):
         """Graceful shutdown."""
