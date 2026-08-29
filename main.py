@@ -150,7 +150,7 @@ class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
     OWNER_ID = env_int("OWNER_ID", 0, 1)
     MONGO_URI = os.getenv("MONGO_URI", "").strip()
-    MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "telegram_downloader").strip()
+    MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "YTDownloader").strip()
 
     # IMPORTANT: default stays "proxies" for existing Main Bot compatibility.
     PROXY_COLLECTION = os.getenv("MONGO_COLLECTION", "proxies").strip()
