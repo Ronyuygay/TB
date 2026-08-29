@@ -92,6 +92,7 @@ from urllib.parse import quote, unquote, urlparse
 import aiohttp
 from aiohttp import web
 from pymongo import ASCENDING, DESCENDING, AsyncMongoClient
+from pymongo.errors import OperationFailure
 
 try:
     from pyrogram import Client, filters
@@ -150,7 +151,7 @@ class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
     OWNER_ID = env_int("OWNER_ID", 0, 1)
     MONGO_URI = os.getenv("MONGO_URI", "").strip()
-    MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "YTDownloader").strip()
+    MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "telegram_downloader").strip()
 
     # IMPORTANT: default stays "proxies" for existing Main Bot compatibility.
     PROXY_COLLECTION = os.getenv("MONGO_COLLECTION", "proxies").strip()
@@ -640,8 +641,17 @@ class Database:
         logger.info("[DB] MongoDB connected (idempotent init, no destructive operations)")
 
     async def ensure_indexes(self) -> None:
-        # All index creation is idempotent - safe to run on every restart.
-        await self.proxies.create_index([("proxy_id", ASCENDING)], unique=True, sparse=True)
+        # Catch index conflict errors from older bot versions and recreate them safely
+        try:
+            await self.proxies.create_index([("proxy_id", ASCENDING)], unique=True, sparse=True)
+        except OperationFailure as e:
+            if e.code == 86:  # IndexKeySpecsConflict
+                logger.warning("[DB] Index conflict for proxy_id. Dropping old index and recreating...")
+                await self.proxies.drop_index("proxy_id_1")
+                await self.proxies.create_index([("proxy_id", ASCENDING)], unique=True, sparse=True)
+            else:
+                raise
+
         await self.proxies.create_index(
             [
                 ("enabled", ASCENDING),
@@ -1695,14 +1705,23 @@ class WorkerScheduler:
 
     async def stop(self) -> None:
         self.state.stop_event.set()
+        
+        # Safely gather only tasks that were actually created
+        tasks_to_wait = []
         for task in (self.dispatcher_task, self.periodic_task):
-            if task:
+            if task is not None:
                 task.cancel()
-        await asyncio.gather(self.dispatcher_task, self.periodic_task, return_exceptions=True)
+                tasks_to_wait.append(task)
+                
+        if tasks_to_wait:
+            await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+            
         for task in list(self.state.tasks):
             task.cancel()
+            
         if self.state.tasks:
             await asyncio.gather(*self.state.tasks, return_exceptions=True)
+            
         self.state.scheduler_running = False
 
     # --- bounded dispatch queue ----------------------------------------------
