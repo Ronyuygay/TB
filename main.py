@@ -1,2348 +1,2438 @@
 #!/usr/bin/env python3
 """
-Proxy Worker Bot — Complete Implementation
-===========================================
-A dedicated proxy intelligence worker that discovers, normalizes, deduplicates,
-persists, tests (generic + YouTube), scores, quarantines, and refreshes proxies.
-It stores all verified proxy data in MongoDB for consumption by the Main Bot.
-This bot does NOT download media or handle end-user requests.
+Dedicated Proxy Worker Bot - single-file implementation (v2).
 
-Author: Production Engineering
+This application is a proxy-intelligence/service worker. It does NOT download
+YouTube media for end users and does NOT post content anywhere. Its output is
+verified proxy connectivity intelligence persisted in MongoDB for consumption
+by a separate Main Bot.
+
+Design foundation: Code A (ChatGPT version) architecture and safety
+characteristics (coarse-grained scheduler, bounded queue, bounded test
+concurrency, byte-capped source fetches, content-hash change detection,
+lease-based duplicate-work prevention, YouTube-target health guard).
+
+Selectively integrated from Code B:
+    - Source-removal awareness (adapted: only affects proxies that were
+      NEVER validated as working; a proxy that has ever been WORKING is
+      permanent and is never removed just because a source stopped listing
+      it).
+    - Explicit state-constant classes for readability.
+
+New in this revision (per operator requirements):
+    - Generic GitHub repo/tree source resolution (not provider-specific),
+      with a cached resolved-file lookup to avoid re-listing the directory
+      on every refresh.
+    - Multi-format source parsing (TXT / JSON / CSV) kept separate from
+      proxy validation logic.
+    - Country metadata is reused from source data when available, avoiding
+      an extra geolocation request per proxy.
+    - A cheap TCP "pre-check" runs before any HTTP request is made, so a
+      dead proxy costs zero external bandwidth.
+    - Working proxies are permanent records: source removal, worker
+      restarts, and worker crashes never delete them. Only an explicit
+      failure policy (consecutive-failure threshold) can move a permanent
+      record to PERMANENTLY_FAILED, and the record itself is retained.
+    - Optional, disabled-by-default Instagram connectivity validator,
+      fully separate from the YouTube validator.
+    - Notifications are sent only on meaningful state changes (new working,
+      recovered, permanently failed) to avoid spamming the same result.
+
+Core flow:
+    configured source(s) -> resolve -> fetch (hash + size capped)
+        -> parse (format-specific) -> normalize -> deduplicate
+        -> persist (NORMALIZED) -> bounded queue -> lease/claim
+        -> cheap TCP check -> country (source metadata reused if present)
+        -> YouTube validation (skip-download) -> optional Instagram check
+        -> failure classification -> backoff / quarantine / permanent state
+        -> permanent MongoDB working pool -> Telegram notification -> Main Bot
+
+Python:
+    3.12+
+
+Required environment:
+    BOT_TOKEN
+    OWNER_ID
+    MONGO_URI
+
+Recommended packages:
+    aiohttp
+    aiohttp-socks
+    pyrogram
+    tgcrypto
+    pymongo
+    yt-dlp
+
+Run:
+    python main.py
 """
 
+from __future__ import annotations
+
 import asyncio
-import aiohttp
-import aiohttp.web
-import asyncio.subprocess
-import base64
 import csv
 import hashlib
 import io
+import ipaddress
 import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
 import time
-import urllib.parse
-from collections import defaultdict, deque
-from contextlib import asynccontextmanager
+from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import quote, unquote, urlparse
 
-# Third-party imports
-import motor.motor_asyncio  # PyMongo Async
-from telebot.async_telebot import AsyncTeleBot
-from telebot import types as tgtypes
-import yt_dlp  # only for version, actual test via subprocess
+import aiohttp
+from aiohttp import web
+from pymongo import ASCENDING, DESCENDING, AsyncMongoClient
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s'
-)
-logger = logging.getLogger("ProxyWorker")
+try:
+    from pyrogram import Client, filters
+    from pyrogram.errors import FloodWait
+    from pyrogram.types import (
+        InlineKeyboardButton,
+        InlineKeyboardMarkup,
+        Message,
+        CallbackQuery,
+    )
+except Exception:  # pragma: no cover - optional at import time for tooling
+    Client = None
+    filters = None
+    FloodWait = Exception
+    InlineKeyboardButton = None
+    InlineKeyboardMarkup = None
+    Message = Any
+    CallbackQuery = Any
+
+try:
+    from aiohttp_socks import ProxyConnector
+except Exception:  # pragma: no cover
+    ProxyConnector = None
 
 
-# ======================================================================
+# ============================================================================
 # CONFIGURATION
-# ======================================================================
+# ============================================================================
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int, minimum: int = 0, maximum: Optional[int] = None) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(value, maximum)
+    return value
+
+
+def env_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    return tuple(x.strip() for x in raw.split(",") if x.strip())
+
+
 class Config:
-    """Central configuration loaded from environment variables."""
-    def __init__(self):
-        self.BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-        self.OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-        self.MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-        self.MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "telegram_downloader")
+    BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+    OWNER_ID = env_int("OWNER_ID", 0, 1)
+    MONGO_URI = os.getenv("MONGO_URI", "").strip()
+    MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "telegram_downloader").strip()
 
-        # HTTP server
-        self.PORT = int(os.getenv("PORT", "8080"))
-        self.HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0")
-        self.WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # optional
+    # IMPORTANT: default stays "proxies" for existing Main Bot compatibility.
+    PROXY_COLLECTION = os.getenv("MONGO_COLLECTION", "proxies").strip()
 
-        # Test limits
-        self.PROXY_TEST_CONCURRENCY = int(os.getenv("PROXY_TEST_CONCURRENCY", "5"))
-        self.YOUTUBE_TEST_TIMEOUT = int(os.getenv("YOUTUBE_TEST_TIMEOUT", "30"))
-        self.HTTP_CONNECT_TIMEOUT = int(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
-        self.SOURCE_REFRESH_SECONDS = int(os.getenv("SOURCE_REFRESH_SECONDS", "300"))
-        self.DAILY_REPORT_HOUR = int(os.getenv("DAILY_REPORT_HOUR", "9"))
-        self.YOUTUBE_MAX_FORMAT_CHECKS = int(os.getenv("YOUTUBE_MAX_FORMAT_CHECKS", "3"))
-        self.PROXY_QUARANTINE_HOURS = int(os.getenv("PROXY_QUARANTINE_HOURS", "6"))
-        self.MAX_PROXIES_PER_REFRESH = int(os.getenv("MAX_PROXIES_PER_REFRESH", "1000"))
-        self.CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "3600"))
-        self.REPORT_CHAT_ID = os.getenv("REPORT_CHAT_ID", "")  # defaults to owner
-        self.MAX_PENDING_TESTS = int(os.getenv("MAX_PENDING_TESTS", "500"))
-        self.TEST_ENGINE_VERSION = int(os.getenv("TEST_ENGINE_VERSION", "1"))
+    PORT = env_int("PORT", 8080, 1, 65535)
 
-        # YouTube test URL (can be overridden in DB settings)
-        self.DEFAULT_YOUTUBE_TEST_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
-        self.YOUTUBE_TEST_URL = os.getenv("YOUTUBE_TEST_URL", self.DEFAULT_YOUTUBE_TEST_URL)
+    # --- Scheduler cadence (Code A's coarse-grained model, kept on purpose) ---
+    SOURCE_REFRESH_SECONDS = env_int("SOURCE_REFRESH_SECONDS", 300, 30)
+    TEST_CONCURRENCY = env_int("PROXY_TEST_CONCURRENCY", 5, 1, 50)
+    MAX_PENDING_TESTS = env_int("MAX_PENDING_TESTS", 1000, 1, 10000)
+    MAX_TEST_PER_REFRESH = env_int("MAX_PROXIES_PER_REFRESH", 300, 1, 5000)
 
-        # Internal state
-        self.mongo_client: Optional[motor.motor_asyncio.AsyncIOMotorClient] = None
-        self.db = None
-        self.bot: Optional[AsyncTeleBot] = None
-        self.aiohttp_session: Optional[aiohttp.ClientSession] = None
+    # --- Timeouts ---
+    CONNECT_CHECK_TIMEOUT = env_int("CONNECT_CHECK_TIMEOUT", 6, 1, 30)
+    GENERIC_TIMEOUT = env_int("HTTP_CONNECT_TIMEOUT", 12, 3, 120)
+    GEO_TIMEOUT = env_int("GEO_TIMEOUT", 10, 3, 60)
+    YOUTUBE_TIMEOUT = env_int("YOUTUBE_TEST_TIMEOUT", 45, 10, 180)
+    INSTAGRAM_TIMEOUT = env_int("INSTAGRAM_TEST_TIMEOUT", 15, 5, 60)
 
-    def validate(self) -> bool:
-        if not self.BOT_TOKEN:
-            logger.critical("BOT_TOKEN is missing")
-            return False
-        if self.OWNER_ID == 0:
-            logger.critical("OWNER_ID is missing or invalid")
-            return False
-        if not self.MONGO_URI:
-            logger.critical("MONGO_URI is missing")
-            return False
+    # --- Revalidation / failure policy ---
+    # Operator requirement: previously-approved proxies are revalidated
+    # roughly every 2-3 days by default, not hard-coded to one value.
+    REVALIDATION_INTERVAL = env_int("REVALIDATION_INTERVAL", 3 * 86400, 300, 14 * 86400)
+    QUARANTINE_BASE_SECONDS = env_int("PROXY_QUARANTINE_SECONDS", 21600, 300, 7 * 86400)
+    MAX_QUARANTINE_SECONDS = env_int("MAX_QUARANTINE_SECONDS", 7 * 86400, 3600, 30 * 86400)
+    MAX_CONSECUTIVE_FAILURES = env_int("MAX_CONSECUTIVE_FAILURES", 5, 1, 50)
+
+    # Only affects proxies that were NEVER validated as working. Working
+    # proxies are permanent and are never auto-retired by this setting.
+    ORPHAN_RETIRE_AFTER_SECONDS = env_int("ORPHAN_RETIRE_AFTER_SECONDS", 7 * 86400, 3600, 60 * 86400)
+
+    DAILY_REPORT_HOUR = env_int("DAILY_REPORT_HOUR", 9, 0, 23)
+    DAILY_REPORT_MINUTE = env_int("DAILY_REPORT_MINUTE", 0, 0, 59)
+
+    YOUTUBE_TEST_URL = os.getenv(
+        "YOUTUBE_TEST_URL",
+        "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+    ).strip()
+
+    YTDLP_BINARY = os.getenv("YTDLP_BINARY", "yt-dlp").strip()
+    TEST_ENGINE_VERSION = os.getenv("TEST_ENGINE_VERSION", "2").strip()
+    YTDLP_REMOTE_COMPONENTS = os.getenv("YTDLP_REMOTE_COMPONENTS", "").strip()
+
+    ENABLE_GEO_LOOKUP = env_bool("ENABLE_GEO_LOOKUP", True)
+    GEO_LOOKUP_URL = os.getenv("GEO_LOOKUP_URL", "https://ipwho.is/{ip}").strip()
+
+    # --- Optional secondary validator (disabled by default) ---
+    INSTAGRAM_VALIDATION_ENABLED = env_bool("INSTAGRAM_VALIDATION_ENABLED", False)
+    INSTAGRAM_TEST_URL = os.getenv("INSTAGRAM_TEST_URL", "https://www.instagram.com/").strip()
+
+    REPORT_ENABLED = env_bool("REPORT_ENABLED", True)
+    DEBUG = env_bool("DEBUG", False)
+    DRY_RUN = env_bool("DRY_RUN", False)
+
+    MAX_SOURCE_BYTES = env_int("MAX_SOURCE_BYTES", 50 * 1024 * 1024, 1024, 200 * 1024 * 1024)
+    MAX_DISCOVERED_PER_SOURCE = env_int("MAX_DISCOVERED_PER_SOURCE", 10000, 1, 100000)
+
+    SOURCE_FAILURE_ALERT_THRESHOLD = env_int("SOURCE_FAILURE_ALERT_THRESHOLD", 3, 1, 20)
+
+    MAX_RETRIES = env_int("NETWORK_RETRIES", 1, 0, 3)
+    MAX_YTDLP_FORMATS = env_int("YOUTUBE_MAX_FORMAT_CHECKS", 50, 1, 1000)
+    ADMIN_CHAT_ID = env_int("REPORT_CHAT_ID", OWNER_ID, 1)
+
+    # How long a resolved GitHub directory listing (tree -> actual raw file)
+    # stays cached before being re-resolved. Directory contents rarely
+    # change, so this avoids an extra GitHub API call on every refresh.
+    SOURCE_RESOLVE_CACHE_SECONDS = env_int("SOURCE_RESOLVE_CACHE_SECONDS", 6 * 3600, 300, 7 * 86400)
+
+    # Preference order when a source resolves to a directory containing
+    # multiple formats (e.g. data.txt / data.json / data.csv). JSON is
+    # preferred first because it commonly carries country/protocol metadata
+    # that would otherwise require an extra geolocation request per proxy.
+    PREFERRED_SOURCE_FORMATS = env_list("PREFERRED_SOURCE_FORMATS", ("json", "txt", "csv"))
+
+    USER_AGENT = os.getenv(
+        "HTTP_USER_AGENT",
+        "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36",
+    ).strip()
+
+    # No sources are enabled automatically. The operator adds and controls
+    # the configured source list explicitly (Telegram admin UI or this
+    # list). This intentionally replaces the old behaviour of auto-seeding
+    # third-party proxy-list mirrors on first run.
+    DEFAULT_SOURCES: tuple[dict[str, Any], ...] = ()
+
+    @classmethod
+    def validate(cls) -> None:
+        missing = []
+        if not cls.BOT_TOKEN:
+            missing.append("BOT_TOKEN")
+        if not cls.OWNER_ID:
+            missing.append("OWNER_ID")
+        if not cls.MONGO_URI:
+            missing.append("MONGO_URI")
+        if missing:
+            raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
+
+        parsed = urlparse(cls.YOUTUBE_TEST_URL)
+        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+            "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"
+        }:
+            raise RuntimeError("YOUTUBE_TEST_URL must be a valid YouTube URL.")
+
+        if not cls.YTDLP_BINARY:
+            raise RuntimeError("YTDLP_BINARY cannot be empty.")
+
+
+# ============================================================================
+# LOGGING / HELPERS
+# ============================================================================
+
+class SecretFilter(logging.Filter):
+    _patterns = (
+        re.compile(r"(mongodb(?:\+srv)?://)([^/\s]+)@", re.I),
+        re.compile(r"((?:https?|socks4|socks5)://)([^/\s:@]+):([^@\s]+)@", re.I),
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        text = str(record.msg)
+        for pattern in self._patterns:
+            if pattern.groups == 2:
+                text = pattern.sub(r"\1***@", text)
+            else:
+                text = pattern.sub(r"\1***:***@", text)
+        record.msg = text
         return True
 
 
-config = Config()
+logging.basicConfig(
+    level=logging.DEBUG if Config.DEBUG else logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("proxy-worker")
+logger.addFilter(SecretFilter())
+
+UTC = timezone.utc
 
 
-# ======================================================================
-# CONSTANTS AND STATE MACHINE
-# ======================================================================
-class ProxyState:
-    DISCOVERED = "DISCOVERED"
-    NORMALIZED = "NORMALIZED"
-    UNTESTED = "UNTESTED"
-    TESTING = "TESTING"
-    GENERIC_WORKING = "GENERIC_WORKING"
-    YOUTUBE_WORKING = "YOUTUBE_WORKING"
-    YOUTUBE_REJECTED = "YOUTUBE_REJECTED"
-    TIMEOUT = "TIMEOUT"
-    CONNECTION_FAILED = "CONNECTION_FAILED"
-    GEO_VERIFIED = "GEO_VERIFIED"
-    QUARANTINED = "QUARANTINED"
-    RETIRED = "RETIRED"
-    DISABLED = "DISABLED"
+def now_utc() -> datetime:
+    return datetime.now(UTC)
 
 
-class SourceType:
-    GITHUB = "GITHUB"
-    PROXIFLY = "PROXIFLY"
-    RAW_TXT = "RAW_TXT"
-    MANUAL_URL = "MANUAL_URL"
-    MANUAL_TEXT = "MANUAL_TEXT"
-    MANUAL_FILE = "MANUAL_FILE"
-    API = "API"
-    OTHER = "OTHER"
-
-
-class TaskStatus:
-    QUEUED = "QUEUED"
-    RUNNING = "RUNNING"
-    PAUSED = "PAUSED"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
-    CANCELLED = "CANCELLED"
-
-
-class YoutubeResult:
-    SUCCESS = "SUCCESS"
-    TIMEOUT = "TIMEOUT"
-    CONNECTION_FAILURE = "CONNECTION_FAILURE"
-    PROXY_AUTH_FAILURE = "PROXY_AUTH_FAILURE"
-    YOUTUBE_BOT_REJECTION = "YOUTUBE_BOT_REJECTION"
-    YOUTUBE_RELOAD_REJECTION = "YOUTUBE_RELOAD_REJECTION"
-    GEO_RESTRICTION = "GEO_RESTRICTION"
-    AUTH_REQUIRED = "AUTH_REQUIRED"
-    YT_DLP_ERROR = "YT_DLP_ERROR"
-    JS_RUNTIME_ERROR = "JS_RUNTIME_ERROR"
-    UNKNOWN = "UNKNOWN"
-
-
-# Valid transitions for state machine (simplified, enforced in code)
-VALID_TRANSITIONS = {
-    ProxyState.DISCOVERED: {ProxyState.NORMALIZED, ProxyState.UNTESTED},
-    ProxyState.NORMALIZED: {ProxyState.UNTESTED, ProxyState.DISABLED},
-    ProxyState.UNTESTED: {ProxyState.TESTING, ProxyState.DISABLED},
-    ProxyState.TESTING: {
-        ProxyState.GENERIC_WORKING,
-        ProxyState.YOUTUBE_WORKING,
-        ProxyState.YOUTUBE_REJECTED,
-        ProxyState.TIMEOUT,
-        ProxyState.CONNECTION_FAILED,
-        ProxyState.GEO_VERIFIED,
-        ProxyState.QUARANTINED,
-        ProxyState.DISABLED,
-    },
-    ProxyState.GENERIC_WORKING: {
-        ProxyState.TESTING,
-        ProxyState.YOUTUBE_WORKING,
-        ProxyState.YOUTUBE_REJECTED,
-        ProxyState.QUARANTINED,
-        ProxyState.DISABLED,
-    },
-    ProxyState.YOUTUBE_WORKING: {
-        ProxyState.TESTING,  # revalidation
-        ProxyState.QUARANTINED,
-        ProxyState.DISABLED,
-        ProxyState.RETIRED,
-    },
-    ProxyState.YOUTUBE_REJECTED: {
-        ProxyState.TESTING,
-        ProxyState.QUARANTINED,
-        ProxyState.DISABLED,
-        ProxyState.RETIRED,
-    },
-    ProxyState.TIMEOUT: {
-        ProxyState.UNTESTED,  # retry later
-        ProxyState.TESTING,
-        ProxyState.DISABLED,
-    },
-    ProxyState.CONNECTION_FAILED: {
-        ProxyState.UNTESTED,
-        ProxyState.TESTING,
-        ProxyState.DISABLED,
-    },
-    ProxyState.GEO_VERIFIED: {
-        ProxyState.TESTING,
-        ProxyState.YOUTUBE_WORKING,
-        ProxyState.DISABLED,
-    },
-    ProxyState.QUARANTINED: {
-        ProxyState.TESTING,
-        ProxyState.YOUTUBE_WORKING,
-        ProxyState.UNTESTED,
-        ProxyState.DISABLED,
-        ProxyState.RETIRED,
-    },
-    ProxyState.RETIRED: {
-        ProxyState.UNTESTED,
-        ProxyState.DISABLED,
-    },
-    ProxyState.DISABLED: {
-        ProxyState.UNTESTED,
-        ProxyState.RETIRED,
-    },
-}
-
-
-# ======================================================================
-# UTILITY FUNCTIONS
-# ======================================================================
-def utcnow() -> datetime:
-    """
-    Return a naive datetime object representing the current time in UTC.
-    This prevents offset-naive vs offset-aware conflicts when comparing 
-    dates fetched from MongoDB.
-    """
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-def normalize_proxy_string(proxy_str: str) -> Optional[Dict[str, Any]]:
-    """
-    Normalize a proxy string into a dict with scheme, host, port, username, password.
-    Returns None if invalid.
-    """
-    if not proxy_str or not isinstance(proxy_str, str):
-        return None
-    proxy_str = proxy_str.strip()
-    if not proxy_str:
-        return None
-
-    # Remove surrounding quotes
-    if len(proxy_str) >= 2 and proxy_str[0] == proxy_str[-1] and proxy_str[0] in ("'", '"'):
-        proxy_str = proxy_str[1:-1]
-
-    # Default scheme if missing
-    scheme = None
-    if "://" in proxy_str:
-        scheme_part, rest = proxy_str.split("://", 1)
-        scheme = scheme_part.lower()
-        if scheme not in ("http", "https", "socks4", "socks5"):
-            return None
-        proxy_str = rest
-    else:
-        # assume http
-        scheme = "http"
-
-    # Check for userinfo
-    username = None
-    password = None
-    if "@" in proxy_str:
-        userinfo, hostport = proxy_str.rsplit("@", 1)
-        if ":" in userinfo:
-            username, password = userinfo.split(":", 1)
-        else:
-            username = userinfo
-        proxy_str = hostport
-
-    # Parse host:port
-    if ":" not in proxy_str:
-        return None
-    host, port_str = proxy_str.rsplit(":", 1)
-    if not host or not port_str:
-        return None
-    try:
-        port = int(port_str)
-        if not (1 <= port <= 65535):
-            return None
-    except ValueError:
-        return None
-
-    # Validate host (basic)
-    host = host.strip()
-    if not host:
-        return None
-    # Remove brackets if IPv6
-    if host.startswith("[") and host.endswith("]"):
-        host = host[1:-1]
-
-    return {
-        "scheme": scheme,
-        "host": host,
-        "port": port,
-        "username": username,
-        "password": password,
-    }
-
-
-def generate_proxy_id(normalized: Dict[str, Any]) -> str:
-    """Generate deterministic SHA-256 hash as proxy ID."""
-    key = f"{normalized['scheme']}://{normalized['username'] or ''}:{normalized['password'] or ''}@{normalized['host']}:{normalized['port']}"
-    return hashlib.sha256(key.encode('utf-8')).hexdigest()
-
-
-def proxy_to_url(normalized: Dict[str, Any], include_credentials=False) -> str:
-    """Convert normalized proxy dict to URL string."""
-    scheme = normalized['scheme']
-    auth = ""
-    if include_credentials and normalized.get('username'):
-        auth = f"{normalized['username']}"
-        if normalized.get('password'):
-            auth += f":{normalized['password']}"
-        auth += "@"
-    host = normalized['host']
-    if ':' in host and not host.startswith('['):
-        host = f"[{host}]"
-    return f"{scheme}://{auth}{host}:{normalized['port']}"
-
-
-def mask_proxy_url(url: str) -> str:
-    """Mask credentials in proxy URL for logging."""
-    if "://" in url:
-        scheme, rest = url.split("://", 1)
-        if "@" in rest:
-            userinfo, hostport = rest.rsplit("@", 1)
-            # mask username/password
-            if ":" in userinfo:
-                user, pwd = userinfo.split(":", 1)
-                masked = f"{user[:2]}***:***"
-            else:
-                masked = f"{userinfo[:2]}***"
-            return f"{scheme}://{masked}@{hostport}"
-        return url
-    return url
-
-
-def parse_proxy_list_text(text: str) -> List[str]:
-    """Parse a text blob into list of proxy strings (one per line)."""
-    if not text:
-        return []
-    return [line.strip() for line in text.splitlines() if line.strip()]
-
-
-def parse_csv_proxies(data: str) -> List[str]:
-    """Extract proxy strings from CSV content."""
-    proxies = []
-    try:
-        reader = csv.reader(io.StringIO(data))
-        for row in reader:
-            for cell in row:
-                cell = cell.strip()
-                if cell and ("://" in cell or ":" in cell):
-                    proxies.append(cell)
-    except csv.Error:
-        pass
-    return proxies
-
-
-def parse_json_proxies(data: str) -> List[str]:
-    """Extract proxy strings from JSON structures."""
-    proxies = []
-    try:
-        obj = json.loads(data)
-    except json.JSONDecodeError:
-        return []
-    if isinstance(obj, list):
-        for item in obj:
-            if isinstance(item, str):
-                proxies.append(item)
-            elif isinstance(item, dict):
-                # try common fields
-                for key in ("proxy", "url", "host", "ip"):
-                    if key in item and isinstance(item[key], str):
-                        proxies.append(item[key])
-    elif isinstance(obj, dict):
-        # try to find arrays
-        for key, value in obj.items():
-            if isinstance(value, list):
-                for item in value:
-                    if isinstance(item, str):
-                        proxies.append(item)
-                    elif isinstance(item, dict):
-                        for k2 in ("proxy", "url", "host", "ip"):
-                            if k2 in item and isinstance(item[k2], str):
-                                proxies.append(item[k2])
-    return proxies
-
-
-def extract_country_from_filename(url: str) -> Optional[str]:
-    """Attempt to extract country code from GitHub URL path."""
-    match = re.search(r'/proxies/countries/([A-Za-z]{2})/', url)
-    if match:
-        return match.group(1).upper()
+def parse_dt(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
     return None
 
 
-def parse_proxies_from_url_content(content: str, url: str = "") -> Tuple[List[Dict], int]:
-    """
-    Parse content from a proxy source URL into list of normalized proxies.
-    Returns (list_of_normalized_dict, invalid_count).
-    """
-    # Try to detect format: raw txt, csv, json
-    proxies_raw = []
-    content = content.strip()
-    if not content:
-        return [], 0
+def short_error(value: Any, limit: int = 700) -> str:
+    text = str(value or "").replace("\x00", " ").strip()
+    return text[:limit]
 
-    # Attempt JSON
-    if content.startswith("[") or content.startswith("{"):
-        proxies_raw = parse_json_proxies(content)
-        if proxies_raw:
-            # validate each
-            normalized_list = []
-            invalid = 0
-            for p in proxies_raw:
-                norm = normalize_proxy_string(p)
-                if norm:
-                    normalized_list.append(norm)
-                else:
-                    invalid += 1
-            return normalized_list, invalid
 
-    # Attempt CSV: detect if many commas
-    if "," in content and "\n" in content:
-        proxies_raw = parse_csv_proxies(content)
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def mask_proxy_string(proxy_url: str) -> str:
+    try:
+        p = urlparse(proxy_url)
+        host = p.hostname or ""
+        port = p.port or ""
+        scheme = p.scheme or "http"
+        return f"{scheme}://{host}:{port}"
+    except Exception:
+        return "<proxy>"
+
+
+# ============================================================================
+# STATE CONSTANTS
+# ============================================================================
+
+class ProxyState:
+    """Validation lifecycle state. Distinct from `enabled`/`retired` flags
+    and from `ever_working`, which is a permanent, never-unset marker."""
+    NORMALIZED = "NORMALIZED"          # parsed + deduplicated, not yet queued
+    QUEUED = "QUEUED"                  # waiting in the bounded test queue
+    TESTING = "TESTING"                # currently leased/under test
+    YOUTUBE_WORKING = "YOUTUBE_WORKING"
+    CONNECTION_FAILED = "CONNECTION_FAILED"
+    TIMEOUT = "TIMEOUT"
+    YOUTUBE_REJECTED = "YOUTUBE_REJECTED"
+    ENVIRONMENT_ERROR = "ENVIRONMENT_ERROR"
+    QUARANTINED = "QUARANTINED"
+    PERMANENTLY_FAILED = "PERMANENTLY_FAILED"   # record retained, just unusable
+    RETIRED = "RETIRED"                # orphan cleanup only; never applied to ever_working proxies
+
+
+class FailureCategory:
+    """Failure classification used to decide retry/quarantine/permanent policy."""
+    CONNECTION_TIMEOUT = "CONNECTION_TIMEOUT"
+    CONNECTION_REFUSED = "CONNECTION_REFUSED"
+    DNS_FAILURE = "DNS_FAILURE"
+    PROXY_PROTOCOL_FAILURE = "PROXY_PROTOCOL_FAILURE"
+    PROXY_AUTH_FAILURE = "PROXY_AUTH_FAILURE"
+    TARGET_UNAVAILABLE = "TARGET_UNAVAILABLE"
+    TEMPORARY_SERVER_FAILURE = "TEMPORARY_SERVER_FAILURE"
+    EXTRACTION_FAILURE = "EXTRACTION_FAILURE"
+    INVALID_PROXY = "INVALID_PROXY"
+    ENVIRONMENT_ERROR = "ENVIRONMENT_ERROR"
+    RATE_LIMITED = "RATE_LIMITED"
+    SUCCESS = "SUCCESS"
+    UNKNOWN = "UNKNOWN"
+
+    # Categories that should NOT count against a proxy's reputation because
+    # they reflect a problem with the *test environment* or the *target*,
+    # not with the proxy route itself.
+    NON_ROUTE_SPECIFIC = frozenset({ENVIRONMENT_ERROR, TARGET_UNAVAILABLE, RATE_LIMITED})
+
+
+# ============================================================================
+# PROXY MODEL / PARSING
+# ============================================================================
+
+@dataclass(frozen=True)
+class ProxyEntry:
+    scheme: str
+    host: str
+    port: int
+    username: Optional[str] = None
+    password: Optional[str] = None
+    source_id: Optional[str] = None
+    source_country: Optional[str] = None
+
+    @property
+    def canonical(self) -> str:
+        auth = ""
+        if self.username is not None:
+            auth = (
+                quote(self.username, safe="")
+                + ":"
+                + quote(self.password or "", safe="")
+                + "@"
+            )
+        host = self.host
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"{self.scheme.lower()}://{auth}{host}:{self.port}"
+
+    @property
+    def proxy_id(self) -> str:
+        # Canonical identity is scheme+host+port+credentials. This means
+        # "ip:port" (implicit http) and "http://ip:port" collapse to the
+        # same identity, but a distinct explicit scheme (e.g. socks5://
+        # same ip:port) is treated as a different route, since it behaves
+        # differently on the wire.
+        return hashlib.sha256(self.canonical.encode("utf-8")).hexdigest()
+
+
+SUPPORTED_SCHEMES = {"http", "https", "socks4", "socks5"}
+PROXY_RE = re.compile(
+    r"^(?:(?P<scheme>https?|socks4|socks5)://)?"
+    r"(?:(?P<user>[^:@/\s]+):(?P<password>[^@/\s]*)@)?"
+    r"(?P<host>\[[0-9a-fA-F:]+\]|[^:/\s]+):"
+    r"(?P<port>\d{1,5})/?$",
+    re.I,
+)
+
+
+def canonical_host(host: str) -> str:
+    host = host.strip().lower().rstrip(".")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    return host
+
+
+def parse_proxy_string(value: str, default_scheme: str = "http") -> Optional[ProxyEntry]:
+    raw = str(value or "").strip().strip("`'\" ,;")
+    if not raw:
+        return None
+
+    raw = re.sub(r"^(?:proxy|server|address)\s*[:=]\s*", "", raw, flags=re.I)
+    match = PROXY_RE.match(raw)
+    if not match:
+        return None
+
+    scheme = (match.group("scheme") or default_scheme).lower()
+    if scheme not in SUPPORTED_SCHEMES:
+        return None
+
+    host = canonical_host(match.group("host"))
+    try:
+        port = int(match.group("port"))
+    except ValueError:
+        return None
+
+    if not (1 <= port <= 65535) or not host or len(host) > 253:
+        return None
+    if any(ch.isspace() for ch in host):
+        return None
+
+    return ProxyEntry(
+        scheme=scheme,
+        host=host,
+        port=port,
+        username=match.group("user"),
+        password=match.group("password"),
+    )
+
+
+# --- format-specific parsers: kept separate from validation logic ---------
+
+def extract_proxy_candidates(text: str) -> list[str]:
+    lines = re.split(r"[\r\n]+", text)
+    out = []
+    for line in lines:
+        line = line.strip().strip(",;")
+        if not line or line.startswith("#"):
+            continue
+        out.append(line)
+    return out
+
+
+@dataclass
+class ParsedCandidate:
+    raw: str
+    scheme_hint: Optional[str] = None
+    country: Optional[str] = None
+    anonymity: Optional[str] = None
+
+
+def parse_txt_payload(text: str) -> list[ParsedCandidate]:
+    return [ParsedCandidate(raw=line) for line in extract_proxy_candidates(text)]
+
+
+def parse_csv_payload(text: str) -> list[ParsedCandidate]:
+    out: list[ParsedCandidate] = []
+    try:
+        reader = csv.reader(io.StringIO(text))
+        rows = list(reader)
+    except Exception:
+        return out
+    if not rows:
+        return out
+
+    header = [c.strip().lower() for c in rows[0]]
+    has_header = any(h in header for h in ("ip", "host", "port", "proxy"))
+    data_rows = rows[1:] if has_header else rows
+
+    def col(row: list[str], name: str) -> Optional[str]:
+        if not has_header or name not in header:
+            return None
+        idx = header.index(name)
+        return row[idx].strip() if idx < len(row) else None
+
+    for row in data_rows:
+        if not row:
+            continue
+        if has_header:
+            ip = col(row, "ip") or col(row, "host")
+            port = col(row, "port")
+            proto = col(row, "protocol") or col(row, "scheme") or col(row, "type")
+            country = col(row, "country") or col(row, "country_code") or col(row, "cc")
+            anon = col(row, "anonymity")
+            if ip and port:
+                candidate = f"{proto + '://' if proto else ''}{ip}:{port}"
+                out.append(ParsedCandidate(raw=candidate, scheme_hint=proto, country=country, anonymity=anon))
+        else:
+            joined = ":".join(c.strip() for c in row if c.strip())
+            if joined:
+                out.append(ParsedCandidate(raw=row[0].strip()))
+    return out
+
+
+def parse_json_payload(text: str) -> list[ParsedCandidate]:
+    out: list[ParsedCandidate] = []
+    try:
+        data = json.loads(text)
+    except Exception:
+        return out
+
+    items: list[Any]
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        # Common shapes: {"proxies": [...]}, {"data": [...]}
+        items = data.get("proxies") or data.get("data") or data.get("items") or []
+        if not isinstance(items, list):
+            items = []
     else:
-        proxies_raw = parse_proxy_list_text(content)
+        items = []
 
-    normalized_list = []
-    invalid = 0
-    for p in proxies_raw:
-        norm = normalize_proxy_string(p)
-        if norm:
-            normalized_list.append(norm)
-        else:
-            invalid += 1
-    return normalized_list, invalid
+    for item in items:
+        if isinstance(item, str):
+            out.append(ParsedCandidate(raw=item))
+            continue
+        if not isinstance(item, dict):
+            continue
 
+        host = item.get("ip") or item.get("host") or item.get("address")
+        port = item.get("port")
+        proto = (item.get("protocol") or item.get("scheme") or item.get("type") or "").lower() or None
+        anon = item.get("anonymity") or item.get("anonymityLevel")
 
-# ======================================================================
-# MONGODB HELPERS
-# ======================================================================
-async def get_db():
-    if config.db is None:
-        config.mongo_client = motor.motor_asyncio.AsyncIOMotorClient(config.MONGO_URI)
-        config.db = config.mongo_client[config.MONGO_DB_NAME]
-        await ensure_indexes()
-    return config.db
+        # Country may be a flat field or nested under a geolocation object
+        # (e.g. Proxifly's {"geolocation": {"country": "US", ...}}).
+        country = item.get("country") or item.get("country_code") or item.get("geo")
+        geoloc = item.get("geolocation")
+        if not country and isinstance(geoloc, dict):
+            country = geoloc.get("country") or geoloc.get("country_code")
 
+        # Prefer the source's own fully-formed proxy string when present -
+        # it already encodes the correct scheme and avoids reconstruction.
+        if isinstance(item.get("proxy"), str) and item["proxy"].strip():
+            out.append(ParsedCandidate(raw=item["proxy"], scheme_hint=proto, country=country, anonymity=anon))
+        elif host and port:
+            candidate = f"{proto + '://' if proto else ''}{host}:{port}"
+            out.append(ParsedCandidate(raw=candidate, scheme_hint=proto, country=country, anonymity=anon))
 
-async def ensure_indexes():
-    db = config.db
-    # Proxies collection indexes (no unique host:port index)
-    await db.proxies.create_index([("state", 1), ("quarantine_until", 1)])
-    await db.proxies.create_index([("country_code", 1), ("youtube_score", -1)])
-    await db.proxies.create_index([("host", 1), ("port", 1)])   # non-unique
-    await db.proxies.create_index([("last_seen_at", -1)])
-    await db.proxies.create_index([("source_id", 1)])
-    # ... rest of indexes remain unchanged
-    await db.proxy_sources.create_index("source_id", unique=True)
-    await db.source_snapshots.create_index([("source_id", 1), ("fetched_at", -1)])
-    await db.task_runs.create_index("task_id", unique=True)
-    await db.task_runs.create_index([("status", 1), ("started_at", -1)])
-    await db.proxy_events.create_index([("proxy_id", 1), ("created_at", -1)])
-    await db.worker_settings.create_index("key", unique=True)
-    await db.worker_state.create_index("key", unique=True)
-    await db.proxy_feedback.create_index([("proxy_id", 1), ("created_at", -1)])
+    return out
 
 
-# ======================================================================
-# PROXY REPOSITORY
-# ======================================================================
-class ProxyRepository:
-    """Handles database operations for proxies."""
-    def __init__(self, db):
-        self.db = db
-        self.proxies = db.proxies
+def detect_format(content_type: str, url: str) -> str:
+    ct = (content_type or "").lower()
+    path = urlparse(url).path.lower()
+    if "json" in ct or path.endswith(".json"):
+        return "json"
+    if "csv" in ct or path.endswith(".csv"):
+        return "csv"
+    return "txt"
 
-    async def upsert_new_proxy(self, normalized: Dict[str, Any], source_id: str,
-                               source_country: Optional[str] = None,
-                               source_protocol: Optional[str] = None) -> Tuple[str, bool]:
-        """
-        Insert a new proxy if not exists. Returns (proxy_id, is_new).
-        """
-        proxy_id = generate_proxy_id(normalized)
-        existing = await self.proxies.find_one({"_id": proxy_id})
-        if existing:
-            update_fields = {
-                "$set": {
-                    "last_seen_at": utcnow(),
-                    "source_id": source_id,
-                    "source_country": source_country if source_country else existing.get("source_country"),
-                    "source_protocol": source_protocol if source_protocol else existing.get("source_protocol"),
-                    "source_missing": False,
-                }
-            }
-            if not existing.get("proxy_id"):
-                update_fields["$set"]["proxy_id"] = proxy_id
-            await self.proxies.update_one({"_id": proxy_id}, update_fields)
-            return proxy_id, False
 
-        now = utcnow()
-        doc = {
-            "_id": proxy_id,
-            "proxy_id": proxy_id,          # <-- important for unique index
-            "scheme": normalized["scheme"],
-            "host": normalized["host"],
-            "port": normalized["port"],
-            "username": normalized.get("username"),
-            "password": normalized.get("password"),
-            "state": ProxyState.UNTESTED,
-            "created_at": now,
-            "last_seen_at": now,
-            "source_id": source_id,
-            "source_country": source_country,
-            "source_protocol": source_protocol or normalized["scheme"],
-            "country_code": None,
-            "country_name": None,
-            "country_source": None,
-            "country_verified_at": None,
-            "generic_health": None,
-            "youtube_health": None,
-            "youtube_score": 0.0,
-            "youtube_success_count": 0,
-            "youtube_failure_count": 0,
-            "youtube_consecutive_failures": 0,
-            "youtube_last_success_at": None,
-            "youtube_last_failure_at": None,
-            "youtube_banned_until": None,
-            "quarantine_until": None,
-            "latency_ms": None,
-            "last_test_duration": None,
-            "formats_found": None,
-            "tested_at": None,
-            "yt_dlp_version": None,
-            "test_engine_version": config.TEST_ENGINE_VERSION,
-            "enabled": True,
-            "source_missing": False,
-            "retired_at": None,
-            "retirement_reason": None,
-            "last_activity_at": now,
-        }
+def parse_source_payload(text: str, content_type: str, url: str = "") -> list[ParsedCandidate]:
+    fmt = detect_format(content_type, url)
+    if fmt == "json":
+        parsed = parse_json_payload(text)
+        if parsed:
+            return parsed
+        return parse_txt_payload(text)
+    if fmt == "csv":
+        parsed = parse_csv_payload(text)
+        if parsed:
+            return parsed
+        return parse_txt_payload(text)
+    return parse_txt_payload(text)
+
+
+# ============================================================================
+# DATABASE
+# ============================================================================
+
+class Database:
+    def __init__(self) -> None:
+        self.client: Optional[AsyncMongoClient] = None
+        self.db = None
+        self.proxies = None
+        self.sources = None
+        self.tasks = None
+        self.snapshots = None
+        self.events = None
+        self.feedback = None
+        self.daily = None
+        self.worker_config = None
+
+    async def connect(self) -> None:
+        self.client = AsyncMongoClient(
+            Config.MONGO_URI,
+            serverSelectionTimeoutMS=8000,
+            connectTimeoutMS=8000,
+            socketTimeoutMS=20000,
+            retryWrites=True,
+        )
+        await self.client.admin.command("ping")
+        self.db = self.client[Config.MONGO_DB_NAME]
+
+        self.proxies = self.db[Config.PROXY_COLLECTION]
+        self.sources = self.db["proxy_sources"]
+        self.tasks = self.db["proxy_tasks"]
+        self.snapshots = self.db["proxy_source_snapshots"]
+        self.events = self.db["proxy_events"]
+        self.feedback = self.db["proxy_feedback"]
+        self.daily = self.db["proxy_daily_summary"]
+        self.worker_config = self.db["worker_config"]
+
+        await self.ensure_indexes()
+        logger.info("[DB] MongoDB connected (idempotent init, no destructive operations)")
+
+    async def ensure_indexes(self) -> None:
+        # All index creation is idempotent - safe to run on every restart.
+        await self.proxies.create_index([("proxy_id", ASCENDING)], unique=True, sparse=True)
+        await self.proxies.create_index(
+            [
+                ("enabled", ASCENDING),
+                ("state", ASCENDING),
+                ("quarantine_until", ASCENDING),
+                ("youtube_score", DESCENDING),
+            ]
+        )
+        await self.proxies.create_index([("ever_working", ASCENDING)])
+        await self.proxies.create_index([("verified_country", ASCENDING)])
+        await self.proxies.create_index([("scheme", ASCENDING)])
+        await self.proxies.create_index([("last_tested_at", ASCENDING)])
+        await self.proxies.create_index([("next_validation_at", ASCENDING)])
+        await self.proxies.create_index([("lease_until", ASCENDING)])
+        await self.proxies.create_index([("source_ids", ASCENDING)])
+
+        await self.sources.create_index([("source_id", ASCENDING)], unique=True)
+        await self.tasks.create_index([("task_id", ASCENDING)], unique=True)
+        await self.tasks.create_index([("status", ASCENDING), ("created_at", DESCENDING)])
+        await self.snapshots.create_index([("source_id", ASCENDING), ("fetched_at", DESCENDING)])
+        await self.events.create_index([("proxy_id", ASCENDING), ("created_at", DESCENDING)])
+        await self.feedback.create_index([("proxy_id", ASCENDING), ("created_at", DESCENDING)])
+        await self.daily.create_index([("date", ASCENDING)], unique=True)
+
+        # TTL-style bounded history: events/snapshots older than 30 days are
+        # pruned by the scheduler's cleanup pass (see WorkerScheduler.cleanup_history),
+        # not deleted here. Indexes above just make that pass efficient.
+
+    async def ping(self) -> bool:
         try:
-            await self.proxies.insert_one(doc)
-            return proxy_id, True
-        except Exception as e:
-            logger.error(f"Failed to insert proxy {proxy_id}: {e}")
-            existing = await self.proxies.find_one({"_id": proxy_id})
-            if existing:
-                if not existing.get("proxy_id"):
-                    await self.proxies.update_one(
-                        {"_id": proxy_id},
-                        {"$set": {"proxy_id": proxy_id, "last_seen_at": utcnow(), "source_missing": False}}
-                    )
-                else:
-                    await self.proxies.update_one(
-                        {"_id": proxy_id},
-                        {"$set": {"last_seen_at": utcnow(), "source_missing": False}}
-                    )
-                return proxy_id, False
-            raise
+            if self.client is None:
+                return False
+            await self.client.admin.command("ping")
+            return True
+        except Exception:
+            return False
 
-    async def get_proxy_by_id(self, proxy_id: str) -> Optional[Dict]:
-        return await self.proxies.find_one({"_id": proxy_id})
+    async def close(self) -> None:
+        if self.client:
+            self.client.close()
+            self.client = None
+            logger.info("[DB] MongoDB closed")
 
-    async def get_proxy_for_testing(self, proxy_id: str) -> Optional[Dict]:
-        # Atomic claim using lease
-        now = utcnow()
-        result = await self.proxies.find_one_and_update(
-            {
-                "_id": proxy_id,
-                "state": {"$in": [ProxyState.UNTESTED, ProxyState.TIMEOUT, ProxyState.CONNECTION_FAILED, ProxyState.YOUTUBE_REJECTED, ProxyState.GENERIC_WORKING]},
-                "$or": [
-                    {"testing_lease_until": {"$exists": False}},
-                    {"testing_lease_until": None},
-                    {"testing_lease_until": {"$lt": now}},
-                ],
-                "enabled": True,
-            },
-            {
-                "$set": {
-                    "state": ProxyState.TESTING,
-                    "testing_lease_until": now + timedelta(seconds=120),
-                    "testing_by": "worker",
-                    "testing_started_at": now,
-                }
-            },
-            return_document=True
-        )
-        return result
+    # --- worker_config (small key/value store) -----------------------------
 
-    async def release_test_lease(self, proxy_id: str):
-        await self.proxies.update_one(
-            {"_id": proxy_id},
-            {"$set": {"testing_lease_until": None, "testing_by": None, "testing_started_at": None}}
+    async def get_config(self, key: str, default: Any = None) -> Any:
+        doc = await self.worker_config.find_one({"_id": key})
+        return doc.get("value", default) if doc else default
+
+    async def set_config(self, key: str, value: Any) -> None:
+        await self.worker_config.update_one(
+            {"_id": key},
+            {"$set": {"value": value, "updated_at": now_utc()}},
+            upsert=True,
         )
 
-    async def update_proxy_test_result(self, proxy_id: str, result: Dict[str, Any], state: str,
-                                       generic_health: Optional[bool] = None,
-                                       youtube_health: Optional[bool] = None,
-                                       country_code: Optional[str] = None,
-                                       country_name: Optional[str] = None,
-                                       country_source: Optional[str] = None,
-                                       latency_ms: Optional[int] = None,
-                                       test_duration: Optional[float] = None,
-                                       formats_found: Optional[int] = None,
-                                       yt_dlp_version: Optional[str] = None,
-                                       error_category: Optional[str] = None,
-                                       error_details: Optional[str] = None):
-        now = utcnow()
-        update = {
-            "$set": {
-                "state": state,
-                "tested_at": now,
-                "last_activity_at": now,
-                "testing_lease_until": None,
-                "testing_by": None,
-                "testing_started_at": None,
-                "test_engine_version": config.TEST_ENGINE_VERSION,
-            },
-            "$inc": {
-                "test_count": 1,
-            }
+    async def initialize_defaults(self) -> None:
+        # No third-party sources are auto-seeded. The operator is fully in
+        # control of the source list (Config.DEFAULT_SOURCES is empty by
+        # design; use /add_source or upsert_source to configure one).
+        for src in Config.DEFAULT_SOURCES:
+            await self.upsert_source({**src}, only_if_missing=True)
+
+        defaults = {
+            "youtube_test_url": Config.YOUTUBE_TEST_URL,
+            "test_engine_version": Config.TEST_ENGINE_VERSION,
+            "dry_run": Config.DRY_RUN,
         }
-        if generic_health is not None:
-            update["$set"]["generic_health"] = generic_health
-        if youtube_health is not None:
-            update["$set"]["youtube_health"] = youtube_health
-        if country_code:
-            update["$set"]["country_code"] = country_code
-            update["$set"]["country_name"] = country_name
-            update["$set"]["country_source"] = country_source or "EXIT_IP"
-            update["$set"]["country_verified_at"] = now
-        if latency_ms is not None:
-            update["$set"]["latency_ms"] = latency_ms
-        if test_duration is not None:
-            update["$set"]["last_test_duration"] = test_duration
-        if formats_found is not None:
-            update["$set"]["formats_found"] = formats_found
-        if yt_dlp_version:
-            update["$set"]["yt_dlp_version"] = yt_dlp_version
-        if error_category:
-            update["$set"]["last_error_category"] = error_category
-        if error_details:
-            update["$set"]["last_error_details"] = error_details[:500]
+        for key, value in defaults.items():
+            if await self.get_config(key) is None:
+                await self.set_config(key, value)
 
-        if state == ProxyState.YOUTUBE_WORKING:
-            update["$inc"]["youtube_success_count"] = 1
-            update["$set"]["youtube_consecutive_failures"] = 0
-            update["$set"]["youtube_last_success_at"] = now
-            update["$set"]["youtube_banned_until"] = None
-            update["$inc"]["youtube_score"] = 10.0
-        elif state in [ProxyState.YOUTUBE_REJECTED, ProxyState.TIMEOUT, ProxyState.CONNECTION_FAILED]:
-            update["$inc"]["youtube_failure_count"] = 1
-            update["$inc"]["youtube_consecutive_failures"] = 1
-            update["$set"]["youtube_last_failure_at"] = now
-            update["$inc"]["youtube_score"] = -5.0
-            if state == ProxyState.YOUTUBE_REJECTED:
-                quarantine_hours = config.PROXY_QUARANTINE_HOURS
-                quarantine_until = now + timedelta(hours=quarantine_hours)
-                update["$set"]["quarantine_until"] = quarantine_until
-                update["$set"]["state"] = ProxyState.QUARANTINED
+    # --- sources -------------------------------------------------------------
 
-        await self.proxies.update_one({"_id": proxy_id}, update)
+    async def get_sources(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        query = {"enabled": True} if enabled_only else {}
+        return await self.sources.find(query).sort("priority", DESCENDING).to_list(length=500)
 
-    async def mark_source_missing(self, proxy_ids: List[str]):
-        if proxy_ids:
-            await self.proxies.update_many(
-                {"_id": {"$in": proxy_ids}},
-                {"$set": {"source_missing": True}}
-            )
+    async def get_source(self, source_id: str) -> Optional[dict[str, Any]]:
+        return await self.sources.find_one({"source_id": source_id})
 
-    async def retire_missing_proxies(self, older_than_hours: int = 24):
-        threshold = utcnow() - timedelta(hours=older_than_hours)
-        result = await self.proxies.update_many(
-            {"source_missing": True, "last_seen_at": {"$lt": threshold}, "state": {"$ne": ProxyState.RETIRED}},
-            {"$set": {"state": ProxyState.RETIRED, "retired_at": utcnow(), "retirement_reason": "source_missing"}}
-        )
-        return result.modified_count
-
-    async def find_working_proxies(self, country_code: Optional[str] = None,
-                                   limit: int = 50) -> List[Dict]:
-        query = {
-            "state": ProxyState.YOUTUBE_WORKING,
-            "enabled": True,
-            "quarantine_until": None,
-            "youtube_last_success_at": {"$ne": None},
-        }
-        if country_code:
-            query["country_code"] = country_code
-        cursor = self.proxies.find(query).sort([("youtube_score", -1), ("youtube_last_success_at", -1)]).limit(limit)
-        return await cursor.to_list(length=limit)
-
-    async def get_stats(self) -> Dict[str, Any]:
-        pipeline = [
-            {"$group": {
-                "_id": "$state",
-                "count": {"$sum": 1},
-            }}
-        ]
-        state_counts = {}
-        async for doc in self.proxies.aggregate(pipeline):
-            state_counts[doc["_id"]] = doc["count"]
-
-        total = sum(state_counts.values())
-        working = state_counts.get(ProxyState.YOUTUBE_WORKING, 0)
-        quarantined = state_counts.get(ProxyState.QUARANTINED, 0)
-        untested = state_counts.get(ProxyState.UNTESTED, 0)
-        testing = state_counts.get(ProxyState.TESTING, 0)
-        retired = state_counts.get(ProxyState.RETIRED, 0)
-        disabled = state_counts.get(ProxyState.DISABLED, 0)
-
-        country_pipeline = [
-            {"$match": {"country_code": {"$ne": None}}},
-            {"$group": {"_id": "$country_code", "count": {"$sum": 1},
-                        "working": {"$sum": {"$cond": [{"$eq": ["$state", ProxyState.YOUTUBE_WORKING]}, 1, 0]}}}},
-        ]
-        countries = {}
-        async for doc in self.proxies.aggregate(country_pipeline):
-            countries[doc["_id"]] = {"total": doc["count"], "working": doc["working"]}
-
-        return {
-            "total": total,
-            "working": working,
-            "quarantined": quarantined,
-            "untested": untested,
-            "testing": testing,
-            "retired": retired,
-            "disabled": disabled,
-            "countries": countries,
-            "state_counts": state_counts,
-        }
-
-    async def find_proxy_by_host_port(self, host: str, port: int) -> Optional[Dict]:
-        return await self.proxies.find_one({"host": host, "port": port})
-
-    async def get_recently_successful_due_for_revalidation(self, limit: int = 10) -> List[Dict]:
-        threshold = utcnow() - timedelta(hours=config.PROXY_QUARANTINE_HOURS)
-        cursor = self.proxies.find({
-            "state": ProxyState.YOUTUBE_WORKING,
-            "youtube_last_success_at": {"$lt": threshold},
-            "enabled": True,
-        }).sort("youtube_last_success_at", 1).limit(limit)
-        return await cursor.to_list(length=limit)
-
-    async def get_untested_proxies(self, limit: int = 50) -> List[Dict]:
-        cursor = self.proxies.find({
-            "state": {"$in": [ProxyState.UNTESTED, ProxyState.TIMEOUT, ProxyState.CONNECTION_FAILED]},
-            "enabled": True,
-        }).sort("created_at", 1).limit(limit)
-        return await cursor.to_list(length=limit)
-
-    async def force_retest_proxy(self, proxy_id: str):
-        await self.proxies.update_one(
-            {"_id": proxy_id},
-            {"$set": {"state": ProxyState.UNTESTED, "quarantine_until": None}}
-        )
-
-    async def disable_proxy(self, proxy_id: str):
-        await self.proxies.update_one({"_id": proxy_id}, {"$set": {"enabled": False}})
-
-    async def enable_proxy(self, proxy_id: str):
-        await self.proxies.update_one({"_id": proxy_id}, {"$set": {"enabled": True}})
-
-    async def quarantine_proxy(self, proxy_id: str, hours: int):
-        until = utcnow() + timedelta(hours=hours)
-        await self.proxies.update_one(
-            {"_id": proxy_id},
-            {"$set": {"state": ProxyState.QUARANTINED, "quarantine_until": until}}
-        )
-
-    async def clear_quarantine(self, proxy_id: str):
-        await self.proxies.update_one(
-            {"_id": proxy_id},
-            {"$set": {"state": ProxyState.UNTESTED, "quarantine_until": None}}
-        )
-
-    async def add_feedback_event(self, proxy_id: str, event_type: str, success: bool,
-                                 error_category: Optional[str] = None, job_id: Optional[str] = None,
-                                 platform: str = "main_bot"):
-        doc = {
-            "proxy_id": proxy_id,
-            "event_type": event_type,
-            "success": success,
-            "error_category": error_category,
-            "job_id": job_id,
-            "platform": platform,
-            "created_at": utcnow(),
-        }
-        await config.db.proxy_feedback.insert_one(doc)
-        if success:
-            await self.proxies.update_one(
-                {"_id": proxy_id},
-                {"$inc": {"real_success_count": 1, "youtube_success_count": 1},
-                 "$set": {"real_last_success_at": utcnow(), "youtube_consecutive_failures": 0}}
-            )
-        else:
-            await self.proxies.update_one(
-                {"_id": proxy_id},
-                {"$inc": {"real_failure_count": 1, "youtube_failure_count": 1},
-                 "$set": {"real_last_failure_at": utcnow()}}
-            )
-
-
-# ======================================================================
-# SOURCE MANAGER
-# ======================================================================
-class ProxySourceManager:
-    """Fetches and processes proxy sources."""
-    def __init__(self, db, session: aiohttp.ClientSession):
-        self.db = db
-        self.sources = db.proxy_sources
-        self.snapshots = db.source_snapshots
-        self.session = session
-
-    async def initialize_default_sources(self):
-        """Ensure default Proxifly sources exist."""
-        default_sources = [
-            {
-                "source_id": "proxifly_all",
-                "name": "Proxifly All",
-                "url": "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
-                "source_type": SourceType.PROXIFLY,
-                "enabled": True,
-                "country": None,
-                "protocol": None,
-                "last_checked_at": None,
-                "last_success_at": None,
-                "last_failure_at": None,
-                "last_content_hash": None,
-                "last_item_count": 0,
-                "fetch_interval": config.SOURCE_REFRESH_SECONDS,
-                "priority": 100,
-                "backoff_count": 0,
-                "quality_score": 0.0,
-                "created_at": utcnow(),
-            },
-        ]
-        # Add some country-specific ones (optional, can be added manually)
-        # We'll include a few common countries for demonstration.
-        common_countries = ["US", "GB", "DE", "FR", "CA", "IN"]
-        for cc in common_countries:
-            default_sources.append({
-                "source_id": f"proxifly_{cc.lower()}",
-                "name": f"Proxifly {cc}",
-                "url": f"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/countries/{cc}/data.txt",
-                "source_type": SourceType.PROXIFLY,
-                "enabled": True,
-                "country": cc,
-                "protocol": None,
-                "last_checked_at": None,
-                "last_success_at": None,
-                "last_failure_at": None,
-                "last_content_hash": None,
-                "last_item_count": 0,
-                "fetch_interval": config.SOURCE_REFRESH_SECONDS,
-                "priority": 100,
-                "backoff_count": 0,
-                "quality_score": 0.0,
-                "created_at": utcnow(),
-            })
-
-        for src in default_sources:
-            await self.sources.update_one(
-                {"source_id": src["source_id"]},
-                {"$setOnInsert": src},
-                upsert=True
-            )
-
-    async def get_enabled_sources(self) -> List[Dict]:
-        cursor = self.sources.find({"enabled": True}).sort("priority", -1)
-        return await cursor.to_list(length=100)
-
-    async def fetch_source_content(self, source: Dict) -> Tuple[Optional[str], Optional[str]]:
-        """Fetch content of a source. Returns (content, error)."""
-        url = source["url"]
-        
-        # Automatically convert GitHub blob URLs to raw URLs for proper text extraction
-        if "github.com" in url and "/blob/" in url:
-            url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-
-        try:
-            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                if resp.status != 200:
-                    return None, f"HTTP {resp.status}"
-                content = await resp.text()
-                return content, None
-        except asyncio.TimeoutError:
-            return None, "timeout"
-        except aiohttp.ClientError as e:
-            return None, str(e)
-        except Exception as e:
-            return None, str(e)
-
-    async def process_source(self, source: Dict, manual: bool = False) -> Dict[str, Any]:
-        """
-        Fetch, parse, dedup, and persist new proxies from a source.
-        Returns summary dict.
-        """
+    async def upsert_source(self, source: dict[str, Any], only_if_missing: bool = False) -> None:
         source_id = source["source_id"]
-        summary = {
-            "source_id": source_id,
-            "fetched": False,
-            "total_fetched": 0,
-            "valid": 0,
-            "duplicates": 0,
-            "invalid": 0,
-            "new": 0,
-            "already_known": 0,
-            "removed": 0,
-            "content_hash": None,
-            "error": None,
-        }
+        source_copy = dict(source)
+        source_copy.pop("_id", None)
 
-        content, error = await self.fetch_source_content(source)
-        if error:
-            summary["error"] = error
-            await self.sources.update_one(
-                {"source_id": source_id},
-                {"$set": {"last_failure_at": utcnow(), "backoff_count": source.get("backoff_count", 0) + 1}}
-            )
-            return summary
-
-        content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
-        summary["content_hash"] = content_hash
-        summary["fetched"] = True
-
-        # Check if unchanged
-        if source.get("last_content_hash") == content_hash:
-            summary["skipped"] = "unchanged"
-            await self.sources.update_one(
-                {"source_id": source_id},
-                {"$set": {"last_checked_at": utcnow()}}
-            )
-            return summary
-
-        # Parse proxies
-        normalized_proxies, invalid_count = parse_proxies_from_url_content(content, source["url"])
-        summary["total_fetched"] = len(normalized_proxies) + invalid_count
-        summary["valid"] = len(normalized_proxies)
-        summary["invalid"] = invalid_count
-
-        # Deduplicate and insert new
-        repo = ProxyRepository(self.db)
-        new_count = 0
-        duplicate_count = 0
-        known_proxy_ids = set()
-        for norm in normalized_proxies:
-            proxy_id, is_new = await repo.upsert_new_proxy(
-                norm,
-                source_id=source_id,
-                source_country=source.get("country") or extract_country_from_filename(source["url"]),
-                source_protocol=source.get("protocol") or norm["scheme"]
-            )
-            known_proxy_ids.add(proxy_id)
-            if is_new:
-                new_count += 1
-            else:
-                duplicate_count += 1
-
-        # Detect removals from previous snapshot
-        previous_snapshot = await self.snapshots.find_one({"source_id": source_id}, sort=[("fetched_at", -1)])
-        if previous_snapshot and "proxy_ids" in previous_snapshot:
-            prev_ids = set(previous_snapshot["proxy_ids"])
-            removed_ids = prev_ids - known_proxy_ids
-            if removed_ids:
-                await repo.mark_source_missing(list(removed_ids))
-                summary["removed"] = len(removed_ids)
-
-        # Store snapshot
-        snapshot_doc = {
-            "source_id": source_id,
-            "fetched_at": utcnow(),
-            "content_hash": content_hash,
-            "count": len(normalized_proxies),
-            "added_count": new_count,
-            "duplicate_count": duplicate_count,
-            "invalid_count": invalid_count,
-            "removed_count": summary["removed"],
-            "proxy_ids": list(known_proxy_ids),
-        }
-        await self.snapshots.insert_one(snapshot_doc)
-
-        # Update source
-        await self.sources.update_one(
-            {"source_id": source_id},
-            {
-                "$set": {
-                    "last_checked_at": utcnow(),
-                    "last_success_at": utcnow(),
-                    "last_content_hash": content_hash,
-                    "last_item_count": len(normalized_proxies),
-                    "backoff_count": 0,
-                }
-            }
-        )
-
-        summary["new"] = new_count
-        summary["duplicates"] = duplicate_count
-        summary["already_known"] = duplicate_count
-        return summary
-
-    async def add_manual_source(self, url: str, source_type: str = SourceType.MANUAL_URL,
-                                country: Optional[str] = None, name: Optional[str] = None) -> str:
-        source_id = hashlib.sha256(f"{source_type}:{url}:{country or ''}".encode()).hexdigest()[:16]
-        doc = {
-            "source_id": source_id,
-            "name": name or url[:50],
-            "url": url,
-            "source_type": source_type,
-            "enabled": True,
-            "country": country,
-            "protocol": None,
+        base_defaults = {
+            "created_at": now_utc(),
+            "failure_count": 0,
             "last_checked_at": None,
             "last_success_at": None,
             "last_failure_at": None,
             "last_content_hash": None,
             "last_item_count": 0,
-            "fetch_interval": config.SOURCE_REFRESH_SECONDS,
-            "priority": 200,  # higher priority for manual
-            "backoff_count": 0,
-            "quality_score": 0.0,
-            "created_at": utcnow(),
+            "stale": False,
+            "resolved_url": None,
+            "resolved_format": None,
+            "resolved_at": None,
+            "known_proxy_ids": [],
         }
-        await self.sources.update_one({"source_id": source_id}, {"$setOnInsert": doc}, upsert=True)
-        return source_id
 
-    async def add_manual_proxies_text(self, text: str, name: str = "Manual Text") -> Dict[str, Any]:
-        """Process manual text input."""
-        return await self._process_manual_proxies(text, source_type=SourceType.MANUAL_TEXT, name=name)
+        if only_if_missing:
+            await self.sources.update_one(
+                {"source_id": source_id},
+                {"$setOnInsert": {**base_defaults, **source_copy}},
+                upsert=True,
+            )
+            return
 
-    async def add_manual_proxies_file(self, content: str, filename: str) -> Dict[str, Any]:
-        """Process uploaded file content."""
-        return await self._process_manual_proxies(content, source_type=SourceType.MANUAL_FILE, name=filename)
-
-    async def _process_manual_proxies(self, content: str, source_type: str, name: str) -> Dict[str, Any]:
-        # For manual data, create a pseudo-source and process.
-        # We'll parse directly and insert with a generated source_id.
-        normalized_proxies, invalid_count = parse_proxies_from_url_content(content)
-        source_id = f"manual_{int(time.time())}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
-        # Insert a manual source record
+        source_copy.setdefault("updated_at", now_utc())
         await self.sources.update_one(
             {"source_id": source_id},
-            {"$set": {
-                "name": name,
-                "url": "manual://",
-                "source_type": source_type,
-                "enabled": False,  # manual source not auto-refreshed
-                "priority": 300,
-                "created_at": utcnow(),
-                "last_checked_at": utcnow(),
-                "last_success_at": utcnow(),
-                "last_item_count": len(normalized_proxies),
-                "last_content_hash": hashlib.sha256(content.encode()).hexdigest(),
-                "backoff_count": 0,
-            }},
-            upsert=True
+            {
+                "$set": source_copy,
+                "$setOnInsert": base_defaults,
+            },
+            upsert=True,
         )
 
-        repo = ProxyRepository(self.db)
-        new_count = 0
-        duplicate_count = 0
-        for norm in normalized_proxies:
-            proxy_id, is_new = await repo.upsert_new_proxy(
-                norm,
-                source_id=source_id,
-                source_country=None,
-                source_protocol=norm["scheme"]
+    async def remove_source(self, source_id: str) -> bool:
+        result = await self.sources.delete_one({"source_id": source_id})
+        return result.deleted_count > 0
+
+    async def record_source_state(
+        self,
+        source_id: str,
+        *,
+        content_hash: Optional[str] = None,
+        item_count: Optional[int] = None,
+        resolved_url: Optional[str] = None,
+        resolved_format: Optional[str] = None,
+        known_proxy_ids: Optional[list[str]] = None,
+        success: bool = False,
+        error: Optional[str] = None,
+    ) -> None:
+        update: dict[str, Any] = {"last_checked_at": now_utc(), "updated_at": now_utc()}
+        if content_hash is not None:
+            update["last_content_hash"] = content_hash
+        if item_count is not None:
+            update["last_item_count"] = item_count
+        if resolved_url is not None:
+            update["resolved_url"] = resolved_url
+            update["resolved_at"] = now_utc()
+        if resolved_format is not None:
+            update["resolved_format"] = resolved_format
+        if known_proxy_ids is not None:
+            # Bounded: this is a set of proxy_id strings (~64 chars each) for
+            # ONE source, overwritten in place every refresh - not appended
+            # to history, so it cannot grow without bound like a per-fetch
+            # snapshot array would.
+            update["known_proxy_ids"] = known_proxy_ids
+
+        if success:
+            update["last_success_at"] = now_utc()
+            update["last_failure_at"] = None
+            update["failure_count"] = 0
+            update["stale"] = False
+            await self.sources.update_one({"source_id": source_id}, {"$set": update})
+        else:
+            update["last_failure_at"] = now_utc()
+            if error:
+                update["last_error"] = short_error(error)
+            await self.sources.update_one(
+                {"source_id": source_id},
+                {"$set": update, "$inc": {"failure_count": 1}},
             )
+
+    async def save_snapshot(self, doc: dict[str, Any]) -> None:
+        # Snapshot documents intentionally do NOT store the full list of
+        # proxy IDs (that lives on the source document, overwritten each
+        # cycle - see record_source_state). Snapshots here are lightweight
+        # counters only, so this collection stays small and bounded.
+        await self.snapshots.insert_one(doc)
+
+    # --- tasks / events (operational history, bounded by cleanup) ----------
+
+    async def create_task(self, task_type: str, source_id: Optional[str] = None) -> str:
+        task_id = hashlib.sha1(f"{task_type}:{source_id}:{time.time_ns()}".encode()).hexdigest()[:16]
+        await self.tasks.insert_one(
+            {
+                "task_id": task_id,
+                "task_type": task_type,
+                "source_id": source_id,
+                "status": "PENDING",
+                "created_at": now_utc(),
+                "started_at": None,
+                "finished_at": None,
+            }
+        )
+        return task_id
+
+    async def start_task(self, task_id: str) -> None:
+        await self.tasks.update_one({"task_id": task_id}, {"$set": {"status": "RUNNING", "started_at": now_utc()}})
+
+    async def finish_task(self, task_id: str, status: str, **fields: Any) -> None:
+        update = {"status": status, "finished_at": now_utc(), **fields}
+        await self.tasks.update_one({"task_id": task_id}, {"$set": update})
+
+    async def update_task(self, task_id: str, **fields: Any) -> None:
+        await self.tasks.update_one({"task_id": task_id}, {"$set": fields})
+
+    async def create_event(self, proxy_id: str, event_type: str, **data: Any) -> None:
+        await self.events.insert_one(
+            {"proxy_id": proxy_id, "event_type": event_type, "created_at": now_utc(), **data}
+        )
+
+    # --- proxies ---------------------------------------------------------------
+
+    async def get_proxy(self, proxy_id: str) -> Optional[dict[str, Any]]:
+        return await self.proxies.find_one({"proxy_id": proxy_id})
+
+    async def upsert_proxy(self, entry: ProxyEntry, country: Optional[str] = None) -> tuple[bool, dict[str, Any]]:
+        """Insert-or-update a NORMALIZED proxy record. Never overwrites an
+        existing record's validation/working history - only source-linkage
+        metadata is refreshed on an existing document."""
+        now = now_utc()
+        existing = await self.proxies.find_one({"proxy_id": entry.proxy_id})
+
+        if existing:
+            update: dict[str, Any] = {
+                "last_seen_at": now,
+                "source_present": True,
+                "enabled": existing.get("enabled", True),
+            }
+            if entry.source_id and entry.source_id not in (existing.get("source_ids") or []):
+                update["source_ids"] = list(set((existing.get("source_ids") or []) + [entry.source_id]))
+            if country and not existing.get("source_country"):
+                update["source_country"] = country
+            await self.proxies.update_one({"proxy_id": entry.proxy_id}, {"$set": update})
+            return False, {**existing, **update}
+
+        doc = {
+            "proxy_id": entry.proxy_id,
+            "scheme": entry.scheme,
+            "host": entry.host,
+            "port": entry.port,
+            "username": entry.username,
+            "password": entry.password,
+            "source_ids": [entry.source_id] if entry.source_id else [],
+            "source_country": country or entry.source_country,
+            "source_present": True,
+            "state": ProxyState.NORMALIZED,
+            "enabled": True,
+            "retired": False,
+            "ever_working": False,
+            "consecutive_failures": 0,
+            "youtube_score": 0.0,
+            "verified_country": None,
+            "first_seen_at": now,
+            "last_seen_at": now,
+            "last_tested_at": None,
+            "next_validation_at": None,
+            "last_success_at": None,
+            "last_failure_at": None,
+            "last_error_category": None,
+            "last_error": None,
+            "quarantine_until": None,
+            "lease_until": None,
+            "last_notified_state": None,
+            "instagram_working": None,
+            "instagram_last_tested_at": None,
+        }
+        await self.proxies.insert_one(doc)
+        return True, doc
+
+    async def claim_proxy(self, proxy_id: str, lease_seconds: int = 180) -> Optional[dict[str, Any]]:
+        now = now_utc()
+        result = await self.proxies.find_one_and_update(
+            {
+                "proxy_id": proxy_id,
+                "$or": [{"lease_until": None}, {"lease_until": {"$lte": now}}],
+            },
+            {
+                "$set": {
+                    "lease_until": now + timedelta(seconds=lease_seconds),
+                    "state": ProxyState.TESTING,
+                }
+            },
+            return_document=True,
+        )
+        return result
+
+    async def release_lease(self, proxy_id: str) -> None:
+        await self.proxies.update_one({"proxy_id": proxy_id}, {"$set": {"lease_until": None}})
+
+    async def release_expired_leases(self) -> int:
+        now = now_utc()
+        result = await self.proxies.update_many(
+            {"lease_until": {"$ne": None, "$lte": now}},
+            {"$set": {"lease_until": None}},
+        )
+        return result.modified_count
+
+    async def record_test_result(self, proxy_id: str, result: dict[str, Any]) -> dict[str, Any]:
+        """Apply a validation result under the permanent-record policy:
+        - ever_working is a one-way flag, never unset.
+        - a permanent (ever_working) record is NEVER deleted; only its
+          `state`/`consecutive_failures`/`quarantine_until` change.
+        - PERMANENTLY_FAILED is reachable only after MAX_CONSECUTIVE_FAILURES
+          consecutive failed revalidations since the last success.
+        """
+        now = now_utc()
+        doc = await self.proxies.find_one({"proxy_id": proxy_id})
+        if not doc:
+            return {}
+
+        state = result.get("state", ProxyState.CONNECTION_FAILED)
+        update: dict[str, Any] = {
+            "lease_until": None,
+            "last_tested_at": now,
+            "last_error_category": result.get("error_category"),
+            "last_error": short_error(result.get("error")) if result.get("error") else None,
+            "latency_ms": result.get("latency_ms"),
+            "generic_ok": result.get("generic_ok"),
+        }
+
+        if result.get("country_code"):
+            update["verified_country"] = result["country_code"]
+            update["country_name"] = result.get("country_name")
+
+        if result.get("instagram_working") is not None:
+            update["instagram_working"] = result.get("instagram_working")
+            update["instagram_last_tested_at"] = now
+
+        if state == ProxyState.YOUTUBE_WORKING:
+            update.update(
+                {
+                    "state": ProxyState.YOUTUBE_WORKING,
+                    "ever_working": True,
+                    "enabled": True,
+                    "consecutive_failures": 0,
+                    "last_success_at": now,
+                    "quarantine_until": None,
+                    "next_validation_at": now + timedelta(seconds=Config.REVALIDATION_INTERVAL),
+                    "youtube_score": min(100.0, safe_float(doc.get("youtube_score")) * 0.7 + 30.0),
+                    "yt_dlp_version": result.get("yt_dlp_version"),
+                    "formats_found": result.get("formats_found"),
+                }
+            )
+        else:
+            consecutive = safe_int(doc.get("consecutive_failures")) + 1
+            update["consecutive_failures"] = consecutive
+            update["last_failure_at"] = now
+            update["youtube_score"] = max(0.0, safe_float(doc.get("youtube_score")) * 0.7)
+
+            non_route = result.get("error_category") in FailureCategory.NON_ROUTE_SPECIFIC
+            if non_route:
+                # Don't penalize the proxy for a target/environment problem;
+                # just retry soon without incrementing the failure counter.
+                update["consecutive_failures"] = doc.get("consecutive_failures", 0)
+                update["state"] = doc.get("state") if doc.get("ever_working") else ProxyState.QUARANTINED
+                update["quarantine_until"] = now + timedelta(minutes=10)
+            elif consecutive >= Config.MAX_CONSECUTIVE_FAILURES:
+                update["state"] = ProxyState.PERMANENTLY_FAILED
+                update["quarantine_until"] = None
+            else:
+                backoff = min(
+                    Config.MAX_QUARANTINE_SECONDS,
+                    Config.QUARANTINE_BASE_SECONDS * (2 ** (consecutive - 1)),
+                )
+                update["state"] = ProxyState.QUARANTINED
+                update["quarantine_until"] = now + timedelta(seconds=backoff)
+                update["next_validation_at"] = update["quarantine_until"]
+
+        await self.proxies.update_one({"proxy_id": proxy_id}, {"$set": update})
+        merged = {**doc, **update}
+        await self.create_event(
+            proxy_id,
+            "TEST_RESULT",
+            state=update.get("state", state),
+            error_category=result.get("error_category"),
+        )
+        return merged
+
+    async def mark_missing_from_sources(self, proxy_ids: list[str]) -> int:
+        """A proxy no longer appears in ANY of its configured sources.
+        This only flags `source_present=False` - it never changes
+        working/state for a proxy that has ever been validated as working.
+        """
+        if not proxy_ids:
+            return 0
+        result = await self.proxies.update_many(
+            {"proxy_id": {"$in": proxy_ids}},
+            {"$set": {"source_present": False, "source_missing_since": now_utc()}},
+        )
+        return result.modified_count
+
+    async def retire_orphans(self, older_than_seconds: int) -> int:
+        """Retire proxies that were NEVER validated as working and have
+        been absent from all sources for a long time. Never touches
+        ever_working=True records."""
+        cutoff = now_utc() - timedelta(seconds=older_than_seconds)
+        result = await self.proxies.update_many(
+            {
+                "ever_working": False,
+                "source_present": False,
+                "source_missing_since": {"$lte": cutoff},
+                "retired": {"$ne": True},
+            },
+            {"$set": {"retired": True, "state": ProxyState.RETIRED, "enabled": False}},
+        )
+        return result.modified_count
+
+    async def cleanup_history(self, days: int = 30) -> dict[str, int]:
+        """Bounded operational history: prunes only auxiliary logs
+        (snapshots/tasks/events). Never touches the proxies collection."""
+        cutoff = now_utc() - timedelta(days=days)
+        out = {}
+        for name, coll, field in (
+            ("snapshots", self.snapshots, "fetched_at"),
+            ("tasks", self.tasks, "created_at"),
+            ("events", self.events, "created_at"),
+        ):
+            result = await coll.delete_many({field: {"$lt": cutoff}})
+            out[name] = result.deleted_count
+        return out
+
+    async def get_stats(self) -> dict[str, Any]:
+        total = await self.proxies.count_documents({})
+        working = await self.proxies.count_documents({"state": ProxyState.YOUTUBE_WORKING, "enabled": True})
+        quarantined = await self.proxies.count_documents({"state": ProxyState.QUARANTINED})
+        permanently_failed = await self.proxies.count_documents({"state": ProxyState.PERMANENTLY_FAILED})
+        retired = await self.proxies.count_documents({"retired": True})
+        ever_working = await self.proxies.count_documents({"ever_working": True})
+        return {
+            "total": total,
+            "working": working,
+            "quarantined": quarantined,
+            "permanently_failed": permanently_failed,
+            "retired": retired,
+            "ever_working": ever_working,
+        }
+
+
+# ============================================================================
+# SOURCE MANAGER - generic GitHub + multi-format resolution
+# ============================================================================
+
+class ProxySourceManager:
+    """Fetches configured sources and turns them into normalized, deduplicated
+    proxy records. Deliberately has no autonomous discovery capability: it
+    only ever touches URLs explicitly configured by the operator. Parsing is
+    fully separate from validation (ProxyValidator)."""
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+        self.session: Optional[aiohttp.ClientSession] = None
+
+    async def start(self) -> None:
+        timeout = aiohttp.ClientTimeout(total=Config.GENERIC_TIMEOUT * 2)
+        headers = {"User-Agent": Config.USER_AGENT, "Accept": "*/*"}
+        self.session = aiohttp.ClientSession(timeout=timeout, headers=headers)
+
+    async def close(self) -> None:
+        if self.session:
+            await self.session.close()
+            self.session = None
+
+    # --- generic GitHub repo/tree resolution --------------------------------
+
+    @staticmethod
+    def _is_github_repo_url(url: str) -> bool:
+        return urlparse(url).netloc.lower() == "github.com"
+
+    async def _list_github_directory(self, owner: str, repo: str, branch: str, path: str) -> list[dict[str, Any]]:
+        """Lightweight, non-recursive directory listing via the GitHub
+        Contents API. Cheaper than the recursive Trees API and returns
+        ready-to-use raw download URLs directly."""
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{quote(path)}?ref={quote(branch)}"
+        async with self.session.get(api_url, headers={"Accept": "application/vnd.github+json"}) as response:
+            if response.status != 200:
+                raise RuntimeError(f"GitHub directory listing failed: HTTP {response.status}")
+            data = await response.json(content_type=None)
+        if not isinstance(data, list):
+            raise RuntimeError("Unexpected GitHub contents API response (not a directory).")
+        return data
+
+    def _pick_preferred_file(self, entries: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        by_ext: dict[str, dict[str, Any]] = {}
+        for entry in entries:
+            if entry.get("type") != "file":
+                continue
+            name = str(entry.get("name", "")).lower()
+            for ext in ("json", "txt", "csv"):
+                if name.endswith(f".{ext}"):
+                    by_ext.setdefault(ext, entry)
+        for ext in Config.PREFERRED_SOURCE_FORMATS:
+            if ext in by_ext:
+                return by_ext[ext]
+        # fall back to any file found
+        for entry in entries:
+            if entry.get("type") == "file":
+                return entry
+        return None
+
+    async def resolve_source_url(self, source: dict[str, Any]) -> tuple[str, str]:
+        """Returns (fetch_url, resolved_format). For a direct raw/blob URL
+        this is immediate. For a GitHub tree (directory) URL, this lists
+        the directory once and caches the chosen raw file URL on the
+        source document for SOURCE_RESOLVE_CACHE_SECONDS, so subsequent
+        refreshes hit the raw file directly without re-listing."""
+        url = str(source["url"]).strip()
+
+        resolved_url = source.get("resolved_url")
+        resolved_at = parse_dt(source.get("resolved_at"))
+        if resolved_url and resolved_at:
+            age = (now_utc() - resolved_at).total_seconds()
+            if age < Config.SOURCE_RESOLVE_CACHE_SECONDS:
+                return resolved_url, source.get("resolved_format") or "txt"
+
+        if not self._is_github_repo_url(url):
+            return url, detect_format("", url)
+
+        parsed = urlparse(url)
+        parts = [unquote(x) for x in parsed.path.split("/") if x]
+
+        # /owner/repo/blob/branch/path -> direct raw file
+        if len(parts) >= 5 and parts[2] == "blob":
+            owner, repo, _, branch = parts[:4]
+            file_path = "/".join(parts[4:])
+            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file_path}"
+            fmt = detect_format("", raw_url)
+            await self.db.record_source_state(source["source_id"], resolved_url=raw_url, resolved_format=fmt)
+            return raw_url, fmt
+
+        # /owner/repo/tree/branch/path -> directory; pick the best file
+        if len(parts) >= 5 and parts[2] == "tree":
+            owner, repo, _, branch = parts[:4]
+            path = "/".join(parts[4:])
+            entries = await self._list_github_directory(owner, repo, branch, path)
+            chosen = self._pick_preferred_file(entries)
+            if not chosen or not chosen.get("download_url"):
+                raise RuntimeError("No usable data file found in configured GitHub directory.")
+            raw_url = chosen["download_url"]
+            fmt = detect_format("", raw_url)
+            await self.db.record_source_state(source["source_id"], resolved_url=raw_url, resolved_format=fmt)
+            return raw_url, fmt
+
+        # Plain github.com/owner/repo/... file view without /blob/ - best effort
+        return url, detect_format("", url)
+
+    # --- fetch (size-capped, retried, hashed) -------------------------------
+
+    async def fetch(self, fetch_url: str) -> tuple[str, str, int]:
+        if not self.session:
+            raise RuntimeError("Source manager is not started.")
+
+        max_bytes = Config.MAX_SOURCE_BYTES
+        last_exc: Optional[Exception] = None
+        for attempt in range(Config.MAX_RETRIES + 1):
+            try:
+                timeout = aiohttp.ClientTimeout(total=Config.GENERIC_TIMEOUT * 3)
+                async with self.session.get(
+                    fetch_url,
+                    timeout=timeout,
+                    allow_redirects=True,
+                    headers={
+                        "User-Agent": Config.USER_AGENT,
+                        "Accept": "application/json,text/plain,text/*,*/*;q=0.8",
+                    },
+                ) as response:
+                    if response.status >= 400:
+                        raise RuntimeError(f"HTTP {response.status}")
+
+                    content_type = response.headers.get("Content-Type", "")
+                    body = bytearray()
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        body.extend(chunk)
+                        if len(body) > max_bytes:
+                            raise RuntimeError("Source exceeds MAX_SOURCE_BYTES.")
+
+                    raw = bytes(body)
+                    text = raw.decode("utf-8", errors="replace")
+                    return text, content_type, len(raw)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < Config.MAX_RETRIES:
+                    await asyncio.sleep(2 ** attempt)
+        raise last_exc or RuntimeError("Unknown source fetch error.")
+
+    async def preview(self, url: str) -> dict[str, Any]:
+        source_id = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+        pseudo_source = {"source_id": source_id, "url": url, "resolved_url": None, "resolved_at": None}
+        fetch_url, fmt = await self.resolve_source_url(pseudo_source)
+        text, content_type, byte_count = await self.fetch(fetch_url)
+        candidates = parse_source_payload(text, content_type, fetch_url)
+        return {
+            "url": url,
+            "fetch_url": fetch_url,
+            "format": fmt,
+            "bytes": byte_count,
+            "estimated_entries": len(candidates),
+        }
+
+    async def import_source(self, source: dict[str, Any], task_id: Optional[str] = None) -> dict[str, Any]:
+        source_id = source["source_id"]
+        fetch_url, fmt = await self.resolve_source_url(source)
+        text, content_type, byte_count = await self.fetch(fetch_url)
+        content_hash = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+        if source.get("last_content_hash") == content_hash:
+            await self.db.record_source_state(source_id, content_hash=content_hash, item_count=0, success=True)
+            if task_id:
+                await self.db.finish_task(task_id, "COMPLETED", unchanged=True)
+            return {"source_id": source_id, "unchanged": True, "fetched": 0, "valid": 0, "new": 0,
+                     "duplicates": 0, "invalid": 0, "already_known": 0, "bytes": byte_count}
+
+        candidates = parse_source_payload(text, content_type, fetch_url)
+        if len(candidates) > Config.MAX_DISCOVERED_PER_SOURCE:
+            candidates = candidates[: Config.MAX_DISCOVERED_PER_SOURCE]
+
+        seen: set[str] = set()
+        invalid = 0
+        duplicates = 0
+        new_count = 0
+        known_count = 0
+        known_ids: list[str] = []
+        source_country_default = source.get("country")
+
+        for candidate in candidates:
+            entry = parse_proxy_string(candidate.raw, default_scheme=candidate.scheme_hint or "http")
+            if not entry:
+                invalid += 1
+                continue
+            country = candidate.country or source_country_default
+            entry = ProxyEntry(
+                scheme=entry.scheme,
+                host=entry.host,
+                port=entry.port,
+                username=entry.username,
+                password=entry.password,
+                source_id=source_id,
+                source_country=country,
+            )
+            if entry.proxy_id in seen:
+                duplicates += 1
+                continue
+            seen.add(entry.proxy_id)
+            known_ids.append(entry.proxy_id)
+
+            is_new, _ = await self.db.upsert_proxy(entry, country=country)
             if is_new:
                 new_count += 1
             else:
-                duplicate_count += 1
+                known_count += 1
+
+        # Adapted from Code B's removal-reconciliation, but bounded to
+        # "was this proxy seen in THIS source's latest fetch" (a single
+        # overwritten field on the source doc, not a growing history), and
+        # it never deletes or changes the state of an ever_working proxy.
+        previous_ids = set(source.get("known_proxy_ids") or [])
+        missing_ids = list(previous_ids - set(known_ids))
+        if missing_ids:
+            await self.db.mark_missing_from_sources(missing_ids)
+
+        await self.db.save_snapshot(
+            {
+                "source_id": source_id,
+                "fetched_at": now_utc(),
+                "content_hash": content_hash,
+                "count": len(known_ids),
+                "added_count": new_count,
+                "duplicate_count": duplicates + known_count,
+                "invalid_count": invalid,
+                "removed_count": len(missing_ids),
+            }
+        )
+        await self.db.record_source_state(
+            source_id,
+            content_hash=content_hash,
+            item_count=len(known_ids),
+            known_proxy_ids=known_ids,
+            success=True,
+        )
+
+        if task_id:
+            await self.db.update_task(
+                task_id,
+                total_items=len(candidates),
+                new_items=new_count,
+                duplicates=duplicates + known_count,
+                invalid=invalid,
+                removed=len(missing_ids),
+            )
 
         return {
-            "received": len(normalized_proxies) + invalid_count,
-            "valid": len(normalized_proxies),
-            "invalid": invalid_count,
+            "source_id": source_id,
+            "unchanged": False,
+            "fetched": len(candidates),
+            "valid": len(known_ids),
             "new": new_count,
-            "duplicates": duplicate_count,
-            "source_id": source_id,
-        }
-
-    async def get_source_by_id(self, source_id: str) -> Optional[Dict]:
-        return await self.sources.find_one({"source_id": source_id})
-
-    async def list_sources(self, enabled_only: bool = False) -> List[Dict]:
-        query = {"enabled": True} if enabled_only else {}
-        cursor = self.sources.find(query).sort("priority", -1)
-        return await cursor.to_list(length=100)
-
-    async def update_source_enabled(self, source_id: str, enabled: bool):
-        await self.sources.update_one({"source_id": source_id}, {"$set": {"enabled": enabled}})
-
-    async def remove_source(self, source_id: str):
-        await self.sources.delete_one({"source_id": source_id})
-        # Also delete snapshots? Maybe keep history but mark disabled.
-        # We'll just disable instead.
-        await self.sources.update_one({"source_id": source_id}, {"$set": {"enabled": False}})
-
-
-# ======================================================================
-# PROXY TESTER
-# ======================================================================
-class ProxyTester:
-    """Handles generic connectivity, country detection, and YouTube validation."""
-    def __init__(self, db, session: aiohttp.ClientSession):
-        self.db = db
-        self.session = session
-        self.repo = ProxyRepository(db)
-
-    async def generic_connectivity_test(self, proxy: Dict) -> Tuple[bool, Optional[int]]:
-        """Test if proxy can connect to a generic site. Returns (success, latency_ms)."""
-        proxy_url = proxy_to_url(proxy, include_credentials=True)
-        test_url = "http://httpbin.org/ip"
-        start = time.monotonic()
-        try:
-            async with self.session.get(
-                test_url,
-                proxy=proxy_url,
-                timeout=aiohttp.ClientTimeout(total=config.HTTP_CONNECT_TIMEOUT)
-            ) as resp:
-                if resp.status == 200:
-                    latency = int((time.monotonic() - start) * 1000)
-                    return True, latency
-                else:
-                    return False, None
-        except asyncio.TimeoutError:
-            return False, None
-        except aiohttp.ClientError:
-            return False, None
-        except Exception:
-            return False, None
-
-    async def get_exit_country(self, proxy: Dict) -> Tuple[Optional[str], Optional[str]]:
-        """Get exit country of proxy using ip-api.com through proxy."""
-        proxy_url = proxy_to_url(proxy, include_credentials=True)
-        try:
-            async with self.session.get(
-                "http://ip-api.com/json/?fields=status,countryCode,country",
-                proxy=proxy_url,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("status") == "success":
-                        return data.get("countryCode"), data.get("country")
-        except Exception:
-            pass
-        return None, None
-
-    async def test_youtube(self, proxy: Dict, test_url: Optional[str] = None) -> Dict[str, Any]:
-        """Run yt-dlp extraction test through proxy using subprocess."""
-        proxy_url = proxy_to_url(proxy, include_credentials=True)
-        url = test_url or config.YOUTUBE_TEST_URL
-
-        # Build yt-dlp command
-        cmd = [
-            sys.executable, "-m", "yt_dlp",
-            "--proxy", proxy_url,
-            "--dump-json",
-            "--no-warnings",
-            "--skip-download",
-            "--no-playlist",
-            "--socket-timeout", str(config.YOUTUBE_TEST_TIMEOUT),
-            "--retries", "1",
-            "--force-ipv4",
-            url
-        ]
-        # Maybe include Deno/EJS if needed but can be handled by yt-dlp itself.
-        env = os.environ.copy()
-        # Ensure we don't hang on JS challenges
-        env["YTDLP_NO_JSRUNTIME"] = "1"  # we'll handle JS separately
-
-        start = time.monotonic()
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=config.YOUTUBE_TEST_TIMEOUT)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                return {
-                    "result": YoutubeResult.TIMEOUT,
-                    "error": "yt-dlp timeout",
-                    "duration": time.monotonic() - start,
-                }
-            duration = time.monotonic() - start
-            stdout_str = stdout.decode('utf-8', errors='replace')
-            stderr_str = stderr.decode('utf-8', errors='replace')
-
-            if proc.returncode == 0 and stdout_str.strip():
-                try:
-                    info = json.loads(stdout_str)
-                    formats = info.get("formats", [])
-                    if formats:
-                        return {
-                            "result": YoutubeResult.SUCCESS,
-                            "duration": duration,
-                            "formats_found": len(formats),
-                            "yt_dlp_version": info.get("yt_dlp_version"),
-                            "country_code": info.get("country") or info.get("uploader_country"),
-                        }
-                    else:
-                        return {
-                            "result": YoutubeResult.YOUTUBE_RELOAD_REJECTION,
-                            "error": "No formats found",
-                            "duration": duration,
-                        }
-                except json.JSONDecodeError:
-                    return {
-                        "result": YoutubeResult.YT_DLP_ERROR,
-                        "error": "Invalid JSON from yt-dlp",
-                        "duration": duration,
-                    }
-
-            # Non-zero exit
-            combined = stderr_str + stdout_str
-            error_lower = combined.lower()
-            if "sign in to confirm you're not a bot" in error_lower:
-                return {"result": YoutubeResult.YOUTUBE_BOT_REJECTION, "error": "YouTube bot check", "duration": duration}
-            elif "the page needs to be reloaded" in error_lower:
-                return {"result": YoutubeResult.YOUTUBE_RELOAD_REJECTION, "error": "YouTube reload required", "duration": duration}
-            elif "proxy authentication" in error_lower or "proxy auth" in error_lower:
-                return {"result": YoutubeResult.PROXY_AUTH_FAILURE, "error": "Proxy auth failed", "duration": duration}
-            elif "georestricted" in error_lower or "geo-restricted" in error_lower:
-                return {"result": YoutubeResult.GEO_RESTRICTION, "error": "Geo restricted", "duration": duration}
-            elif "jsruntime" in error_lower or "deno" in error_lower or "ejs" in error_lower:
-                return {"result": YoutubeResult.JS_RUNTIME_ERROR, "error": "JS runtime error", "duration": duration}
-            elif "connection" in error_lower or "timed out" in error_lower or "timeout" in error_lower:
-                return {"result": YoutubeResult.CONNECTION_FAILURE, "error": combined[:200], "duration": duration}
-            else:
-                return {"result": YoutubeResult.UNKNOWN, "error": combined[:200], "duration": duration}
-        except Exception as e:
-            return {
-                "result": YoutubeResult.UNKNOWN,
-                "error": str(e),
-                "duration": time.monotonic() - start,
-            }
-
-    async def full_test_proxy(self, proxy: Dict, test_url: Optional[str] = None,
-                             skip_generic: bool = False, skip_country: bool = False) -> Dict[str, Any]:
-        """
-        Perform staged testing on a proxy:
-        1. generic connectivity
-        2. country detection (if generic passes)
-        3. YouTube validation
-        Returns result dict.
-        """
-        proxy_id = proxy["_id"]
-        result = {
-            "proxy_id": proxy_id,
-            "generic_ok": None,
-            "latency_ms": None,
-            "country_code": None,
-            "country_name": None,
-            "youtube_result": None,
-            "youtube_error": None,
-            "youtube_duration": None,
-            "youtube_formats": None,
-            "yt_dlp_version": None,
-            "final_state": None,
-            "generic_health": None,
-            "youtube_health": None,
-        }
-
-        # Stage B: generic connectivity
-        if not skip_generic:
-            gen_ok, latency = await self.generic_connectivity_test(proxy)
-            result["generic_ok"] = gen_ok
-            result["latency_ms"] = latency
-            if not gen_ok:
-                result["final_state"] = ProxyState.CONNECTION_FAILED
-                result["generic_health"] = False
-                result["youtube_health"] = False
-                return result
-            result["generic_health"] = True
-
-        # Stage C: country detection (optional but recommended)
-        if not skip_country:
-            cc, cn = await self.get_exit_country(proxy)
-            if cc:
-                result["country_code"] = cc
-                result["country_name"] = cn
-                result["country_source"] = "EXIT_IP"
-
-        # Stage D: YouTube validation
-        yt_result = await self.test_youtube(proxy, test_url=test_url)
-        result["youtube_result"] = yt_result.get("result")
-        result["youtube_error"] = yt_result.get("error")
-        result["youtube_duration"] = yt_result.get("duration")
-        result["youtube_formats"] = yt_result.get("formats_found")
-        result["yt_dlp_version"] = yt_result.get("yt_dlp_version")
-
-        if yt_result.get("result") == YoutubeResult.SUCCESS:
-            result["final_state"] = ProxyState.YOUTUBE_WORKING
-            result["youtube_health"] = True
-        elif yt_result.get("result") in [YoutubeResult.TIMEOUT, YoutubeResult.CONNECTION_FAILURE]:
-            result["final_state"] = yt_result["result"]  # TIMEOUT or CONNECTION_FAILED
-            result["youtube_health"] = False
-        elif yt_result.get("result") in [YoutubeResult.YOUTUBE_BOT_REJECTION,
-                                         YoutubeResult.YOUTUBE_RELOAD_REJECTION]:
-            result["final_state"] = ProxyState.YOUTUBE_REJECTED
-            result["youtube_health"] = False
-        elif yt_result.get("result") in [YoutubeResult.GEO_RESTRICTION,
-                                         YoutubeResult.AUTH_REQUIRED]:
-            result["final_state"] = ProxyState.YOUTUBE_REJECTED
-            result["youtube_health"] = False
-        elif yt_result.get("result") in [YoutubeResult.JS_RUNTIME_ERROR,
-                                         YoutubeResult.YT_DLP_ERROR,
-                                         YoutubeResult.PROXY_AUTH_FAILURE]:
-            # Environment or auth issues; we should not necessarily mark proxy dead.
-            # We'll mark as YT_DLP_ERROR for later re-test.
-            result["final_state"] = ProxyState.YT_DLP_ERROR if yt_result.get("result") != YoutubeResult.PROXY_AUTH_FAILURE else ProxyState.CONNECTION_FAILED
-            result["youtube_health"] = False
-        else:
-            result["final_state"] = ProxyState.CONNECTION_FAILED
-            result["youtube_health"] = False
-
-        return result
-
-    async def test_specific_proxy(self, proxy_id: str) -> Dict[str, Any]:
-        proxy = await self.repo.get_proxy_by_id(proxy_id)
-        if not proxy:
-            return {"error": "Proxy not found"}
-        result = await self.full_test_proxy(proxy)
-        # Update database
-        await self.repo.update_proxy_test_result(
-            proxy_id,
-            result,
-            state=result["final_state"],
-            generic_health=result.get("generic_health"),
-            youtube_health=result.get("youtube_health"),
-            country_code=result.get("country_code"),
-            country_name=result.get("country_name"),
-            country_source="EXIT_IP" if result.get("country_code") else None,
-            latency_ms=result.get("latency_ms"),
-            test_duration=result.get("youtube_duration"),
-            formats_found=result.get("youtube_formats"),
-            yt_dlp_version=result.get("yt_dlp_version"),
-            error_category=result.get("youtube_result"),
-            error_details=result.get("youtube_error"),
-        )
-        return result
-
-
-# ======================================================================
-# SCHEDULER
-# ======================================================================
-class WorkerScheduler:
-    """Coordinates periodic tasks and manual task execution."""
-    def __init__(self, db, source_manager: ProxySourceManager, tester: ProxyTester,
-                 bot: AsyncTeleBot, report_manager, alert_manager):
-        self.db = db
-        self.source_manager = source_manager
-        self.tester = tester
-        self.bot = bot
-        self.report_manager = report_manager
-        self.alert_manager = alert_manager
-        self.tasks = {}  # task_id -> asyncio.Task
-        self.pending_proxy_queue = asyncio.Queue(maxsize=config.MAX_PENDING_TESTS)
-        self.active_test_semaphore = asyncio.Semaphore(config.PROXY_TEST_CONCURRENCY)
-        self.scheduler_running = False
-        self.main_loop_task = None
-
-    async def start(self):
-        self.scheduler_running = True
-        self.main_loop_task = asyncio.create_task(self._main_loop())
-
-    async def stop(self):
-        self.scheduler_running = False
-        if self.main_loop_task:
-            self.main_loop_task.cancel()
-            try:
-                await self.main_loop_task
-            except asyncio.CancelledError:
-                pass
-        # Cancel pending tasks
-        for task in self.tasks.values():
-            task.cancel()
-
-    async def _main_loop(self):
-        """Main scheduler loop."""
-        while self.scheduler_running:
-            try:
-                await self._refresh_sources_if_needed()
-                await self._process_proxy_queue()
-                await self._revalidate_due_proxies()
-                await self._expire_quarantines()
-                await self._cleanup()
-                await asyncio.sleep(10)  # control loop every 10s
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Scheduler loop error: {e}")
-                await asyncio.sleep(10)
-
-    async def _refresh_sources_if_needed(self):
-        """Check for sources due for refresh and process them."""
-        sources = await self.source_manager.get_enabled_sources()
-        now = utcnow()
-        for source in sources:
-            last_checked = source.get("last_checked_at")
-            if last_checked is None or (now - last_checked).total_seconds() >= source.get("fetch_interval", config.SOURCE_REFRESH_SECONDS):
-                # Schedule a refresh task
-                asyncio.create_task(self.refresh_source(source["source_id"]))
-                # To avoid many simultaneous refreshes, limit per loop
-                await asyncio.sleep(1)
-
-    async def refresh_source(self, source_id: str):
-        """Refresh a single source, process new proxies, enqueue tests."""
-        source = await self.source_manager.get_source_by_id(source_id)
-        if not source:
-            return
-        logger.info(f"[SOURCE] refresh started for {source_id}")
-        summary = await self.source_manager.process_source(source)
-        logger.info(f"[SOURCE] {source_id} result: {summary}")
-        await self.report_manager.record_task_result(
-            task_type="source_refresh",
-            source_id=source_id,
-            status=TaskStatus.COMPLETED if summary.get("fetched") else TaskStatus.FAILED,
-            total_items=summary.get("total_fetched"),
-            new_items=summary.get("new"),
-            duplicates=summary.get("duplicates"),
-            invalid=summary.get("invalid"),
-            error=summary.get("error"),
-        )
-        # If new proxies found, enqueue them
-        if summary.get("new", 0) > 0:
-            # We'll fetch the new proxies from DB where source_id matches and state UNTESTED
-            new_proxies = await self.db.proxies.find(
-                {"source_id": source_id, "state": ProxyState.UNTESTED}
-            ).to_list(length=config.MAX_PROXIES_PER_REFRESH)
-            for proxy in new_proxies[:config.MAX_PROXIES_PER_REFRESH]:
-                try:
-                    self.pending_proxy_queue.put_nowait(proxy["_id"])
-                except asyncio.QueueFull:
-                    logger.warning("Pending proxy queue full, dropping new proxy")
-                    break
-
-    async def _process_proxy_queue(self):
-        """Process proxies from queue with bounded concurrency."""
-        while not self.pending_proxy_queue.empty():
-            try:
-                proxy_id = self.pending_proxy_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            asyncio.create_task(self._test_proxy_async(proxy_id))
-            # Avoid creating too many tasks at once; semaphore inside will handle concurrency
-            await asyncio.sleep(0.1)
-
-    async def _test_proxy_async(self, proxy_id: str):
-        async with self.active_test_semaphore:
-            proxy = await self.db.proxies.find_one({"_id": proxy_id})
-            if not proxy or proxy.get("state") == ProxyState.TESTING:
-                return
-            # Claim lease
-            claimed = await self.db.proxies.find_one_and_update(
-                {"_id": proxy_id, "state": {"$ne": ProxyState.TESTING}},
-                {"$set": {"state": ProxyState.TESTING, "testing_lease_until": utcnow() + timedelta(seconds=120)}},
-                return_document=True
-            )
-            if not claimed:
-                return
-            
-            # Changed to logger.debug to avoid log spamming on deployment platforms
-            logger.debug(f"[TEST] proxy_id={proxy_id} start")
-            
-            result = await self.tester.full_test_proxy(claimed)
-            
-            # Update DB
-            await self.tester.repo.update_proxy_test_result(
-                proxy_id,
-                result,
-                state=result["final_state"],
-                generic_health=result.get("generic_health"),
-                youtube_health=result.get("youtube_health"),
-                country_code=result.get("country_code"),
-                country_name=result.get("country_name"),
-                country_source="EXIT_IP" if result.get("country_code") else None,
-                latency_ms=result.get("latency_ms"),
-                test_duration=result.get("youtube_duration"),
-                formats_found=result.get("youtube_formats"),
-                yt_dlp_version=result.get("yt_dlp_version"),
-                error_category=result.get("youtube_result"),
-                error_details=result.get("youtube_error"),
-            )
-            
-            # Changed to logger.debug to avoid log spamming on deployment platforms
-            logger.debug(f"[TEST] proxy_id={proxy_id} result={result['final_state']}")
-
-    async def enqueue_proxy_test(self, proxy_id: str):
-        try:
-            await self.pending_proxy_queue.put(proxy_id)
-        except asyncio.QueueFull:
-            logger.warning("Pending queue full")
-
-    async def _revalidate_due_proxies(self):
-        """Revalidate successful proxies that are due."""
-        proxies_due = await self.tester.repo.get_recently_successful_due_for_revalidation(limit=5)
-        for proxy in proxies_due:
-            await self.enqueue_proxy_test(proxy["_id"])
-
-    async def _expire_quarantines(self):
-        """Move quarantined proxies back to UNTESTED if quarantine expired."""
-        now = utcnow()
-        result = await self.db.proxies.update_many(
-            {"state": ProxyState.QUARANTINED, "quarantine_until": {"$lte": now}},
-            {"$set": {"state": ProxyState.UNTESTED, "quarantine_until": None}}
-        )
-        if result.modified_count > 0:
-            logger.info(f"Released {result.modified_count} quarantined proxies")
-
-    async def _cleanup(self):
-        """Periodic cleanup of old data."""
-        # Clean old source snapshots
-        cutoff = utcnow() - timedelta(days=30)
-        await self.db.source_snapshots.delete_many({"fetched_at": {"$lt": cutoff}})
-        # Clean old task runs
-        await self.db.task_runs.delete_many({"started_at": {"$lt": cutoff}})
-        # Clean old events
-        await self.db.proxy_events.delete_many({"created_at": {"$lt": cutoff}})
-        # Retire source_missing proxies
-        await self.tester.repo.retire_missing_proxies(older_than_hours=48)
-
-    async def manual_test_proxies(self, filter_query: Dict = None, limit: int = 10):
-        """Manually trigger testing of proxies matching filter."""
-        query = filter_query or {}
-        proxies = await self.db.proxies.find(query).limit(limit).to_list(length=limit)
-        for proxy in proxies:
-            await self.enqueue_proxy_test(proxy["_id"])
-        return len(proxies)
-
-    async def manual_revalidate_working(self, limit: int = 10):
-        proxies = await self.db.proxies.find(
-            {"state": ProxyState.YOUTUBE_WORKING, "enabled": True}
-        ).sort("youtube_last_success_at", 1).limit(limit).to_list(length=limit)
-        for proxy in proxies:
-            await self.enqueue_proxy_test(proxy["_id"])
-        return len(proxies)
-
-    async def cancel_task(self, task_id: str):
-        # We can't easily cancel internal tasks, but we can mark task_runs as cancelled
-        await self.db.task_runs.update_one(
-            {"task_id": task_id},
-            {"$set": {"status": TaskStatus.CANCELLED, "finished_at": utcnow()}}
-        )
-
-
-# ======================================================================
-# REPORT MANAGER
-# ======================================================================
-class ReportManager:
-    """Handles generation and sending of reports."""
-    def __init__(self, db, bot: AsyncTeleBot, config):
-        self.db = db
-        self.bot = bot
-        self.config = config
-
-    async def record_task_result(self, task_type: str, status: str, source_id: str = None,
-                                 total_items: int = 0, new_items: int = 0, duplicates: int = 0,
-                                 invalid: int = 0, tested: int = 0, successes: int = 0,
-                                 failures: int = 0, error: str = None, **kwargs):
-        task_id = hashlib.sha256(f"{task_type}:{utcnow().isoformat()}:{os.urandom(4).hex()}".encode()).hexdigest()[:16]
-        doc = {
-            "task_id": task_id,
-            "task_type": task_type,
-            "source_id": source_id,
-            "status": status,
-            "started_at": utcnow(),
-            "finished_at": utcnow() if status in [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED] else None,
-            "total_items": total_items,
-            "new_items": new_items,
-            "duplicates": duplicates,
+            "duplicates": duplicates + known_count,
+            "already_known": known_count,
             "invalid": invalid,
-            "tested": tested,
-            "successes": successes,
-            "failures": failures,
-            "error": error,
-            **kwargs,
+            "removed": len(missing_ids),
+            "bytes": byte_count,
+            "format": fmt,
         }
-        await self.db.task_runs.insert_one(doc)
-        return task_id
 
-    async def generate_daily_report(self) -> str:
-        """Generate a text summary for daily report."""
-        repo = ProxyRepository(self.db)
-        stats = await repo.get_stats()
-        now = utcnow()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        new_today = await self.db.proxies.count_documents({"created_at": {"$gte": today_start}})
-        tested_today = await self.db.proxies.count_documents({"tested_at": {"$gte": today_start}})
-        working_now = stats["working"]
-        quarantined = stats["quarantined"]
-        total = stats["total"]
-        countries = stats["countries"]
 
-        report = [
-            "📊 DAILY WORKER REPORT",
-            f"📅 Date: {now.strftime('%Y-%m-%d')}",
-            f"🕐 Time: {now.strftime('%H:%M UTC')}",
-            "",
-            f"📥 Sources processed: {await self.db.source_snapshots.count_documents({'fetched_at': {'$gte': today_start}})}",
-            f"➕ New proxies today: {new_today}",
-            f"🧪 Tested today: {tested_today}",
-            f"🟢 YouTube working: {working_now}",
-            f"⛔ Quarantined: {quarantined}",
-            f"🗑️ Retired: {stats['retired']}",
-            f"💾 Total known: {total}",
-            "",
-            "🌍 Countries:",
-        ]
-        for cc, data in sorted(countries.items(), key=lambda x: x[1]["working"], reverse=True)[:15]:
-            flag = self._country_flag(cc)
-            report.append(f"{flag} {cc}: total={data['total']}, working={data['working']}")
-        report.append("")
-        report.append(f"🕒 Worker uptime: {self._format_uptime()}")
+# ============================================================================
+# VALIDATION - cheap check first, then YouTube, then optional Instagram
+# ============================================================================
 
-        # Add source health
-        sources = await self.db.proxy_sources.find({"enabled": True}).to_list(length=20)
-        report.append("\n📚 Source Health:")
-        for src in sources[:5]:
-            status = "🟢" if src.get("last_success_at") and (now - src["last_success_at"]).days < 1 else "🔴"
-            report.append(f"{status} {src['name']}: last success {src.get('last_success_at')}")
+class ProxyValidator:
+    def __init__(self) -> None:
+        self._ytdlp_version: Optional[str] = None
+        self._testing_now: set[str] = set()  # in-process guard against duplicate concurrent yt-dlp runs
 
-        return "\n".join(report)
+    async def start(self) -> None:
+        pass
 
-    def _country_flag(self, cc: str) -> str:
-        """Simple flag emoji from country code."""
-        if not cc:
-            return "🏳️"
-        return chr(ord(cc[0]) + 127397) + chr(ord(cc[1]) + 127397)
+    async def close(self) -> None:
+        pass
 
-    def _format_uptime(self) -> str:
-        if not hasattr(self, "_start_time"):
-            self._start_time = utcnow()
-        delta = utcnow() - self._start_time
-        total_seconds = int(delta.total_seconds())
-        hours, rem = divmod(total_seconds, 3600)
-        minutes, seconds = divmod(rem, 60)
-        return f"{hours}h {minutes}m {seconds}s"
+    # --- stage 1: cheapest possible check, no external HTTP at all ---------
 
-    async def send_daily_report(self):
-        chat_id = self.config.REPORT_CHAT_ID or str(self.config.OWNER_ID)
-        report = await self.generate_daily_report()
+    @staticmethod
+    async def tcp_connect_check(entry: ProxyEntry) -> bool:
         try:
-            await self.bot.send_message(chat_id, report)
-        except Exception as e:
-            logger.error(f"Failed to send daily report: {e}")
-
-    async def generate_proxy_file(self, country_code: Optional[str] = None) -> str:
-        """Generate a CSV file of working proxies."""
-        repo = ProxyRepository(self.db)
-        proxies = await repo.find_working_proxies(country_code, limit=500)
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["proxy", "country", "score", "latency_ms", "last_success"])
-        for p in proxies:
-            proxy_str = proxy_to_url(p, include_credentials=False)
-            writer.writerow([
-                proxy_str,
-                p.get("country_code", ""),
-                p.get("youtube_score", 0),
-                p.get("latency_ms", ""),
-                p.get("youtube_last_success_at", "").isoformat() if p.get("youtube_last_success_at") else "",
-            ])
-        return output.getvalue()
-
-    async def send_proxy_file(self, chat_id: str, country_code: Optional[str] = None):
-        content = await self.generate_proxy_file(country_code)
-        filename = f"proxies_{country_code or 'all'}_{utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
-        import io as io_mod
-        file_bytes = content.encode('utf-8')
-        try:
-            await self.bot.send_document(chat_id, io_mod.BytesIO(file_bytes), visible_file_name=filename)
-        except Exception as e:
-            logger.error(f"Failed to send proxy file: {e}")
-
-
-# ======================================================================
-# ALERT MANAGER
-# ======================================================================
-class AlertManager:
-    """Sends alerts with cooldown."""
-    def __init__(self, bot: AsyncTeleBot, owner_id: int):
-        self.bot = bot
-        self.owner_id = owner_id
-        self.last_alert_at = {}  # key -> timestamp
-
-    async def send_alert(self, key: str, message: str, cooldown_seconds: int = 3600):
-        now = time.time()
-        last = self.last_alert_at.get(key, 0)
-        if now - last < cooldown_seconds:
-            return
-        self.last_alert_at[key] = now
-        try:
-            await self.bot.send_message(self.owner_id, f"🚨 {message}")
-        except Exception as e:
-            logger.error(f"Alert failed: {e}")
-
-    async def check_critical_conditions(self, db):
-        # Example: check if no working proxies
-        working_count = await db.proxies.count_documents({
-            "state": ProxyState.YOUTUBE_WORKING,
-            "enabled": True,
-            "quarantine_until": None,
-        })
-        if working_count == 0:
-            await self.send_alert("no_working", "No YouTube-working proxies available!", cooldown_seconds=1800)
-        # Check MongoDB connectivity
-        try:
-            await db.command("ping")
-        except Exception as e:
-            await self.send_alert("mongo_down", f"MongoDB unreachable: {e}", cooldown_seconds=300)
-
-
-# ======================================================================
-# TELEGRAM UI
-# ======================================================================
-class TelegramAdminUI:
-    """Owner-only Telegram interface."""
-    def __init__(self, bot: AsyncTeleBot, db, config, scheduler: WorkerScheduler,
-                 source_manager: ProxySourceManager, tester: ProxyTester,
-                 report_manager: ReportManager, alert_manager: AlertManager):
-        self.bot = bot
-        self.db = db
-        self.config = config
-        self.scheduler = scheduler
-        self.source_manager = source_manager
-        self.tester = tester
-        self.report_manager = report_manager
-        self.alert_manager = alert_manager
-        self.owner_id = config.OWNER_ID
-        self.pending_input = {}  # user_id -> state dict
-        self.progress_messages = {}  # task_id -> message_id
-
-    def is_authorized(self, user_id: int) -> bool:
-        return user_id == self.owner_id
-
-    async def setup_handlers(self):
-        @self.bot.message_handler(commands=['start', 'menu'])
-        async def cmd_start(message):
-            if not self.is_authorized(message.from_user.id):
-                return
-            await self.show_main_dashboard(message.chat.id)
-
-        @self.bot.callback_query_handler(func=lambda call: True)
-        async def callback_query(call):
-            if not self.is_authorized(call.from_user.id):
-                await self.bot.answer_callback_query(call.id, "Unauthorized", show_alert=True)
-                return
-            await self.handle_callback(call)
-
-        @self.bot.message_handler(content_types=['document'])
-        async def handle_document(message):
-            if not self.is_authorized(message.from_user.id):
-                return
-            # Check file size
-            if message.document.file_size > 5 * 1024 * 1024:  # 5MB limit
-                await self.bot.reply_to(message, "File too large (max 5MB)")
-                return
-            file_info = await self.bot.get_file(message.document.file_id)
-            downloaded_file = await self.bot.download_file(file_info.file_path)
-            content = downloaded_file.decode('utf-8', errors='replace')
-            summary = await self.source_manager.add_manual_proxies_file(content, message.document.file_name)
-            await self.bot.reply_to(message, self.format_manual_import_report(summary))
-            # Offer to test new proxies
-            markup = tgtypes.InlineKeyboardMarkup()
-            markup.add(tgtypes.InlineKeyboardButton("🧪 Test New Proxies", callback_data=f"test_new_{summary['source_id']}"))
-            await self.bot.reply_to(message, "Import complete. Do you want to test the new proxies?", reply_markup=markup)
-
-        @self.bot.message_handler(func=lambda message: True)
-        async def handle_text(message):
-            if not self.is_authorized(message.from_user.id):
-                return
-            # Check if waiting for input
-            if message.from_user.id in self.pending_input:
-                await self.handle_pending_input(message)
-                return
-            # Default help
-            await self.show_main_dashboard(message.chat.id)
-
-    async def show_main_dashboard(self, chat_id: int):
-        stats = await ProxyRepository(self.db).get_stats()
-        working = stats["working"]
-        total = stats["total"]
-        testing = stats["testing"]
-        queue_size = self.scheduler.pending_proxy_queue.qsize()
-
-        text = (
-            "🧠 PROXY WORKER\n\n"
-            f"🟢 Worker: Online\n"
-            f"🟢 MongoDB: Connected\n"
-            f"🟢 Scheduler: Running\n\n"
-            f"🌐 YouTube Pool: {working}\n"
-            f"💾 Total Known: {total}\n"
-            f"🧪 Testing: {testing}\n"
-            f"⏳ Queue: {queue_size}\n"
-        )
-
-        markup = tgtypes.InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            tgtypes.InlineKeyboardButton("➕ Add URL", callback_data="add_url"),
-            tgtypes.InlineKeyboardButton("📝 Add Text", callback_data="add_text"),
-            tgtypes.InlineKeyboardButton("📁 Upload File", callback_data="upload_file"),
-            tgtypes.InlineKeyboardButton("📊 System Stats", callback_data="stats"),
-            tgtypes.InlineKeyboardButton("🌍 Countries", callback_data="countries"),
-            tgtypes.InlineKeyboardButton("🧪 Testing", callback_data="testing_menu"),
-            tgtypes.InlineKeyboardButton("📚 Sources", callback_data="sources"),
-            tgtypes.InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
-            tgtypes.InlineKeyboardButton("❤️ Health", callback_data="health"),
-            tgtypes.InlineKeyboardButton("📈 Reports", callback_data="reports"),
-            tgtypes.InlineKeyboardButton("🔄 Refresh Now", callback_data="refresh_now"),
-            tgtypes.InlineKeyboardButton("🗑️ Cleanup", callback_data="cleanup"),
-        )
-        await self.bot.send_message(chat_id, text, reply_markup=markup)
-
-    async def handle_callback(self, call):
-        data = call.data
-        chat_id = call.message.chat.id
-        user_id = call.from_user.id
-
-        # Answer callback to stop loading
-        await self.bot.answer_callback_query(call.id)
-
-        if data == "add_url":
-            self.pending_input[user_id] = {"action": "add_url"}
-            await self.bot.send_message(chat_id, "Please send the source URL:")
-        elif data == "add_text":
-            self.pending_input[user_id] = {"action": "add_text"}
-            await self.bot.send_message(chat_id, "Paste proxy list (one per line):")
-        elif data == "upload_file":
-            await self.bot.send_message(chat_id, "Send a .txt, .csv, or .json file containing proxies.")
-        elif data == "stats":
-            await self.show_stats(chat_id)
-        elif data == "countries":
-            await self.show_countries(chat_id)
-        elif data == "testing_menu":
-            await self.show_testing_menu(chat_id)
-        elif data == "sources":
-            await self.show_sources(chat_id)
-        elif data == "settings":
-            await self.show_settings(chat_id)
-        elif data == "health":
-            await self.show_health(chat_id)
-        elif data == "reports":
-            await self.show_reports(chat_id)
-        elif data == "refresh_now":
-            await self.cmd_refresh_now(chat_id)
-        elif data == "cleanup":
-            await self.cmd_cleanup(chat_id)
-        elif data.startswith("test_new_"):
-            source_id = data[len("test_new_"):]
-            await self.test_new_from_source(chat_id, source_id)
-        elif data.startswith("country_"):
-            cc = data.split("_")[1]
-            await self.show_country_detail(chat_id, cc)
-        elif data.startswith("source_toggle_"):
-            source_id = data[len("source_toggle_"):]
-            await self.toggle_source(chat_id, source_id)
-        elif data.startswith("source_refresh_"):
-            source_id = data[len("source_refresh_"):]
-            await self.refresh_single_source(chat_id, source_id)
-        elif data.startswith("test_specific_"):
-            proxy_id = data[len("test_specific_"):]
-            await self.test_specific_proxy(chat_id, proxy_id)
-        elif data.startswith("export_"):
-            cc = data.split("_")[1] if len(data.split("_")) > 1 else None
-            await self.export_proxies(chat_id, cc)
-        elif data == "settings_concurrency":
-            self.pending_input[user_id] = {"action": "set_concurrency"}
-            await self.bot.send_message(chat_id, "Send new test concurrency (1-50):")
-        elif data == "settings_testurl":
-            self.pending_input[user_id] = {"action": "set_testurl"}
-            await self.bot.send_message(chat_id, "Send new YouTube test URL:")
-        elif data == "settings_quarantine":
-            self.pending_input[user_id] = {"action": "set_quarantine"}
-            await self.bot.send_message(chat_id, "Send quarantine hours (1-72):")
-        elif data == "settings_refresh":
-            self.pending_input[user_id] = {"action": "set_refresh_interval"}
-            await self.bot.send_message(chat_id, "Send source refresh interval in seconds (60-3600):")
-        elif data == "daily_report_now":
-            await self.report_manager.send_daily_report()
-            await self.bot.send_message(chat_id, "Daily report sent.")
-        elif data == "export_all":
-            await self.export_proxies(chat_id, None)
-        elif data == "back_main":
-            await self.show_main_dashboard(chat_id)
-        else:
-            await self.bot.send_message(chat_id, "Unknown action")
-
-    async def handle_pending_input(self, message):
-        user_id = message.from_user.id
-        action = self.pending_input.get(user_id, {}).get("action")
-        if not action:
-            return
-        del self.pending_input[user_id]
-
-        if action == "add_url":
-            url = message.text.strip()
-            # Basic URL validation
-            if not url.startswith(("http://", "https://")):
-                await self.bot.reply_to(message, "Invalid URL. Must start with http:// or https://")
-                return
-            # Validate by fetching a small portion?
-            # For now just add source
-            source_id = await self.source_manager.add_manual_source(url, source_type=SourceType.MANUAL_URL)
-            await self.bot.reply_to(message, f"Source added with ID: {source_id}\nYou can now refresh it.")
-            # Optionally refresh immediately
-            await self.source_manager.process_source(await self.source_manager.get_source_by_id(source_id))
-        elif action == "add_text":
-            summary = await self.source_manager.add_manual_proxies_text(message.text)
-            await self.bot.reply_to(message, self.format_manual_import_report(summary))
-            markup = tgtypes.InlineKeyboardMarkup()
-            markup.add(tgtypes.InlineKeyboardButton("🧪 Test New Proxies", callback_data=f"test_new_{summary['source_id']}"))
-            await self.bot.reply_to(message, "Do you want to test the new proxies?", reply_markup=markup)
-        elif action == "set_concurrency":
+            fut = asyncio.open_connection(entry.host, entry.port)
+            reader, writer = await asyncio.wait_for(fut, timeout=Config.CONNECT_CHECK_TIMEOUT)
+            writer.close()
             try:
-                val = int(message.text)
-                if 1 <= val <= 50:
-                    self.config.PROXY_TEST_CONCURRENCY = val
-                    self.scheduler.active_test_semaphore = asyncio.Semaphore(val)
-                    await self.bot.reply_to(message, f"Concurrency set to {val}")
-                else:
-                    await self.bot.reply_to(message, "Value must be between 1 and 50")
-            except ValueError:
-                await self.bot.reply_to(message, "Invalid number")
-        elif action == "set_testurl":
-            url = message.text.strip()
-            if url.startswith("https://www.youtube.com/"):
-                self.config.YOUTUBE_TEST_URL = url
-                await self.db.worker_settings.update_one(
-                    {"key": "youtube_test_url"},
-                    {"$set": {"value": url, "updated_at": utcnow()}},
-                    upsert=True
-                )
-                await self.bot.reply_to(message, "YouTube test URL updated.")
-            else:
-                await self.bot.reply_to(message, "Invalid YouTube URL")
-        elif action == "set_quarantine":
-            try:
-                val = int(message.text)
-                if 1 <= val <= 72:
-                    self.config.PROXY_QUARANTINE_HOURS = val
-                    await self.bot.reply_to(message, f"Quarantine duration set to {val} hours")
-                else:
-                    await self.bot.reply_to(message, "Value must be 1-72")
-            except ValueError:
-                await self.bot.reply_to(message, "Invalid number")
-        elif action == "set_refresh_interval":
-            try:
-                val = int(message.text)
-                if 60 <= val <= 3600:
-                    self.config.SOURCE_REFRESH_SECONDS = val
-                    await self.bot.reply_to(message, f"Refresh interval set to {val} seconds")
-                else:
-                    await self.bot.reply_to(message, "Value must be 60-3600")
-            except ValueError:
-                await self.bot.reply_to(message, "Invalid number")
-
-    def format_manual_import_report(self, summary: Dict[str, Any]) -> str:
-        return (
-            "📋 MANUAL LIST REPORT\n\n"
-            f"Received: {summary.get('received', 0)}\n"
-            f"✅ Valid: {summary.get('valid', 0)}\n"
-            f"♻️ Duplicates: {summary.get('duplicates', 0)}\n"
-            f"❌ Invalid: {summary.get('invalid', 0)}\n"
-            f"➕ New: {summary.get('new', 0)}\n"
-        )
-
-    async def show_stats(self, chat_id):
-        stats = await ProxyRepository(self.db).get_stats()
-        repo = ProxyRepository(self.db)
-        total = stats["total"]
-        working = stats["working"]
-        quarantined = stats["quarantined"]
-        untested = stats["untested"]
-        testing = stats["testing"]
-        retired = stats["retired"]
-        disabled = stats["disabled"]
-        queue_size = self.scheduler.pending_proxy_queue.qsize()
-
-        text = (
-            "📊 SYSTEM STATS\n\n"
-            f"💾 Total known proxies: {total}\n"
-            f"🟢 YouTube working: {working}\n"
-            f"⛔ Quarantined: {quarantined}\n"
-            f"❓ Untested: {untested}\n"
-            f"🧪 Testing: {testing}\n"
-            f"🗑️ Retired: {retired}\n"
-            f"🚫 Disabled: {disabled}\n"
-            f"⏳ Pending queue: {queue_size}\n"
-            f"🕒 Uptime: {self.report_manager._format_uptime()}\n"
-        )
-        await self.bot.send_message(chat_id, text)
-
-    async def show_countries(self, chat_id):
-        stats = await ProxyRepository(self.db).get_stats()
-        countries = stats["countries"]
-        text = "🌍 PROXY COUNTRIES\n\n"
-        for cc, data in sorted(countries.items(), key=lambda x: x[1]["working"], reverse=True):
-            flag = self.report_manager._country_flag(cc)
-            text += f"{flag} {cc}:\n🟢 Working: {data['working']}\n💾 Total: {data['total']}\n\n"
-        if not countries:
-            text += "No country data available yet."
-        await self.bot.send_message(chat_id, text)
-
-    async def show_country_detail(self, chat_id, cc):
-        proxies = await self.db.proxies.find({"country_code": cc, "state": ProxyState.YOUTUBE_WORKING}).to_list(length=20)
-        text = f"🌍 {cc} Working Proxies\n\n"
-        for p in proxies[:20]:
-            text += f"• {proxy_to_url(p, include_credentials=False)}\n"
-        await self.bot.send_message(chat_id, text)
-
-    async def show_testing_menu(self, chat_id):
-        markup = tgtypes.InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            tgtypes.InlineKeyboardButton("Test New Only", callback_data="test_new_menu"),
-            tgtypes.InlineKeyboardButton("Revalidate Working", callback_data="revalidate_working"),
-            tgtypes.InlineKeyboardButton("Test Specific Proxy", callback_data="test_specific_prompt"),
-            tgtypes.InlineKeyboardButton("Back", callback_data="back_main"),
-        )
-        await self.bot.send_message(chat_id, "🧪 Testing Options", reply_markup=markup)
-
-    async def show_sources(self, chat_id):
-        sources = await self.source_manager.list_sources()
-        text = "📚 Sources\n\n"
-        for src in sources:
-            enabled = "🟢" if src.get("enabled") else "🔴"
-            last = src.get("last_success_at")
-            last_str = last.strftime("%Y-%m-%d %H:%M") if last else "Never"
-            text += f"{enabled} {src['name']} (ID: {src['source_id']})\nLast success: {last_str}\nItems: {src.get('last_item_count', 0)}\n\n"
-        await self.bot.send_message(chat_id, text)
-
-    async def show_settings(self, chat_id):
-        text = (
-            "⚙️ SETTINGS\n\n"
-            f"Test concurrency: {self.config.PROXY_TEST_CONCURRENCY}\n"
-            f"YouTube timeout: {self.config.YOUTUBE_TEST_TIMEOUT}s\n"
-            f"Source refresh interval: {self.config.SOURCE_REFRESH_SECONDS}s\n"
-            f"Quarantine hours: {self.config.PROXY_QUARANTINE_HOURS}\n"
-            f"YouTube test URL: {self.config.YOUTUBE_TEST_URL}\n"
-        )
-        markup = tgtypes.InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            tgtypes.InlineKeyboardButton("Set Concurrency", callback_data="settings_concurrency"),
-            tgtypes.InlineKeyboardButton("Set Test URL", callback_data="settings_testurl"),
-            tgtypes.InlineKeyboardButton("Set Quarantine Hours", callback_data="settings_quarantine"),
-            tgtypes.InlineKeyboardButton("Set Refresh Interval", callback_data="settings_refresh"),
-            tgtypes.InlineKeyboardButton("Back", callback_data="back_main"),
-        )
-        await self.bot.send_message(chat_id, text, reply_markup=markup)
-
-    async def show_health(self, chat_id):
-        # Basic health
-        text = (
-            "❤️ HEALTH\n\n"
-            f"Worker: 🟢 Online\n"
-            f"MongoDB: 🟢 Connected\n"
-            f"Scheduler: 🟢 Running\n"
-            f"Active tests: {self.scheduler.active_test_semaphore._value}\n"
-            f"Queue size: {self.scheduler.pending_proxy_queue.qsize()}\n"
-            f"Uptime: {self.report_manager._format_uptime()}\n"
-        )
-        await self.bot.send_message(chat_id, text)
-
-    async def show_reports(self, chat_id):
-        markup = tgtypes.InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            tgtypes.InlineKeyboardButton("Send Daily Report Now", callback_data="daily_report_now"),
-            tgtypes.InlineKeyboardButton("Export All Working Proxies", callback_data="export_all"),
-            tgtypes.InlineKeyboardButton("Export US Proxies", callback_data="export_US"),
-            tgtypes.InlineKeyboardButton("Export GB Proxies", callback_data="export_GB"),
-            tgtypes.InlineKeyboardButton("Back", callback_data="back_main"),
-        )
-        await self.bot.send_message(chat_id, "📈 Reports", reply_markup=markup)
-
-    async def cmd_refresh_now(self, chat_id):
-        sources = await self.source_manager.get_enabled_sources()
-        await self.bot.send_message(chat_id, f"Refreshing {len(sources)} sources...")
-        for source in sources:
-            await self.scheduler.refresh_source(source["source_id"])
-        await self.bot.send_message(chat_id, "Refresh triggered. Check logs.")
-
-    async def cmd_cleanup(self, chat_id):
-        await self.scheduler._cleanup()
-        await self.bot.send_message(chat_id, "Cleanup completed.")
-
-    async def test_new_from_source(self, chat_id, source_id):
-        # Find untested proxies from that source
-        proxies = await self.db.proxies.find(
-            {"source_id": source_id, "state": ProxyState.UNTESTED}
-        ).limit(config.MAX_PROXIES_PER_REFRESH).to_list(length=config.MAX_PROXIES_PER_REFRESH)
-        count = 0
-        for proxy in proxies:
-            await self.scheduler.enqueue_proxy_test(proxy["_id"])
-            count += 1
-        await self.bot.send_message(chat_id, f"Queued {count} proxies for testing.")
-
-    async def toggle_source(self, chat_id, source_id):
-        source = await self.source_manager.get_source_by_id(source_id)
-        if source:
-            new_enabled = not source.get("enabled", True)
-            await self.source_manager.update_source_enabled(source_id, new_enabled)
-            await self.bot.send_message(chat_id, f"Source {'enabled' if new_enabled else 'disabled'}.")
-        else:
-            await self.bot.send_message(chat_id, "Source not found.")
-
-    async def refresh_single_source(self, chat_id, source_id):
-        await self.scheduler.refresh_source(source_id)
-        await self.bot.send_message(chat_id, f"Source {source_id} refreshed.")
-
-    async def test_specific_proxy(self, chat_id, proxy_id):
-        result = await self.tester.test_specific_proxy(proxy_id)
-        text = (
-            f"Proxy: {proxy_id}\n"
-            f"Result: {result.get('final_state')}\n"
-            f"Generic health: {result.get('generic_health')}\n"
-            f"YouTube health: {result.get('youtube_health')}\n"
-            f"Latency: {result.get('latency_ms')} ms\n"
-            f"Country: {result.get('country_code')}\n"
-            f"YouTube error: {result.get('youtube_error')}\n"
-        )
-        await self.bot.send_message(chat_id, text)
-
-    async def export_proxies(self, chat_id, country_code=None):
-        await self.report_manager.send_proxy_file(str(chat_id), country_code)
-        await self.bot.send_message(chat_id, "Exported proxies file.")
-
-
-# ======================================================================
-# HEALTH SERVER
-# ======================================================================
-class HealthServer:
-    """aiohttp HTTP server for health/ready endpoints and optional webhook."""
-    def __init__(self, config, db, scheduler):
-        self.config = config
-        self.db = db
-        self.scheduler = scheduler
-        self.app = aiohttp.web.Application()
-        self.runner = None
-        self.setup_routes()
-
-    def setup_routes(self):
-        self.app.router.add_get("/", self.root_handler)
-        self.app.router.add_get("/health", self.health_handler)
-        self.app.router.add_get("/ready", self.ready_handler)
-
-    async def root_handler(self, request):
-        return aiohttp.web.Response(text="Proxy Worker Bot is running smoothly.")
-
-    async def health_handler(self, request):
-        mongo_ok = await self.check_mongo()
-        scheduler_running = self.scheduler.scheduler_running
-        stats = await ProxyRepository(self.db).get_stats()
-        data = {
-            "worker": "healthy" if mongo_ok and scheduler_running else "degraded",
-            "mongodb": mongo_ok,
-            "scheduler": scheduler_running,
-            "last_source_refresh": None,  # could compute
-            "active_tests": self.scheduler.active_test_semaphore._value,
-            "queue_size": self.scheduler.pending_proxy_queue.qsize(),
-            "youtube_working": stats["working"],
-            "uptime": self.scheduler.report_manager._format_uptime() if hasattr(self.scheduler, 'report_manager') else "unknown",
-        }
-        return aiohttp.web.json_response(data)
-
-    async def ready_handler(self, request):
-        mongo_ok = await self.check_mongo()
-        if mongo_ok:
-            return aiohttp.web.json_response({"status": "ready"})
-        return aiohttp.web.json_response({"status": "not_ready"}, status=503)
-
-    async def check_mongo(self) -> bool:
-        try:
-            await self.db.command("ping")
+                await writer.wait_closed()
+            except Exception:
+                pass
             return True
         except Exception:
             return False
 
-    async def start(self):
-        self.runner = aiohttp.web.AppRunner(self.app)
-        await self.runner.setup()
-        site = aiohttp.web.TCPSite(self.runner, host=self.config.HTTP_HOST, port=self.config.PORT)
-        await site.start()
-        logger.info(f"Health server running on {self.config.HTTP_HOST}:{self.config.PORT}")
+    # --- stage 2: generic connectivity + exit IP (only if country unknown) -
 
-    async def stop(self):
+    async def generic_check_and_ip(self, entry: ProxyEntry) -> dict[str, Any]:
+        proxy_url = entry.canonical
+        started = time.monotonic()
+
+        if entry.scheme.startswith("socks") and ProxyConnector is None:
+            return {
+                "generic_ok": False,
+                "error_category": FailureCategory.ENVIRONMENT_ERROR,
+                "error": "aiohttp-socks is required for SOCKS proxy validation.",
+            }
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=Config.GENERIC_TIMEOUT)
+            if entry.scheme.startswith("socks"):
+                connector = ProxyConnector.from_url(proxy_url)
+                session = aiohttp.ClientSession(connector=connector, timeout=timeout,
+                                                 headers={"User-Agent": Config.USER_AGENT})
+                try:
+                    async with session.get("https://api.ipify.org?format=json") as response:
+                        body = await response.json(content_type=None)
+                        ok = response.status == 200
+                finally:
+                    await session.close()
+            else:
+                async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": Config.USER_AGENT}) as session:
+                    async with session.get("https://api.ipify.org?format=json", proxy=proxy_url) as response:
+                        body = await response.json(content_type=None)
+                        ok = response.status == 200
+
+            latency_ms = (time.monotonic() - started) * 1000.0
+            if not ok:
+                return {"generic_ok": False, "error_category": FailureCategory.CONNECTION_REFUSED,
+                        "error": "Non-200 from generic connectivity check.", "latency_ms": latency_ms}
+            return {"generic_ok": True, "exit_ip": str(body.get("ip", "")).strip(), "latency_ms": latency_ms}
+        except asyncio.TimeoutError:
+            return {"generic_ok": False, "error_category": FailureCategory.CONNECTION_TIMEOUT,
+                     "error": "Generic connectivity timeout.", "latency_ms": (time.monotonic() - started) * 1000.0}
+        except Exception as exc:
+            text = short_error(exc)
+            lowered = text.lower()
+            if any(k in lowered for k in ("407", "unauthorized", "proxy auth")):
+                category = FailureCategory.PROXY_AUTH_FAILURE
+            elif "name or service not known" in lowered or "getaddrinfo" in lowered:
+                category = FailureCategory.DNS_FAILURE
+            elif "refused" in lowered:
+                category = FailureCategory.CONNECTION_REFUSED
+            else:
+                category = FailureCategory.PROXY_PROTOCOL_FAILURE
+            return {"generic_ok": False, "error_category": category, "error": text,
+                     "latency_ms": (time.monotonic() - started) * 1000.0}
+
+    async def resolve_country(self, ip: str) -> dict[str, Any]:
+        if not Config.ENABLE_GEO_LOOKUP or not ip:
+            return {}
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            return {}
+        url = Config.GEO_LOOKUP_URL.replace("{ip}", quote(ip, safe=""))
+        try:
+            timeout = aiohttp.ClientTimeout(total=Config.GEO_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": Config.USER_AGENT}) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        return {}
+                    data = await response.json(content_type=None)
+                    return {
+                        "country_code": (data.get("country_code") or data.get("country") or "").upper() or None,
+                        "country_name": data.get("country") or data.get("country_name"),
+                    }
+        except Exception:
+            return {}
+
+    # --- stage 3: YouTube (the primary, decisive target) -------------------
+
+    async def get_ytdlp_version(self) -> Optional[str]:
+        if self._ytdlp_version:
+            return self._ytdlp_version
+        try:
+            process = await asyncio.create_subprocess_exec(
+                Config.YTDLP_BINARY, "--version",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=15)
+            if process.returncode == 0:
+                self._ytdlp_version = stdout.decode(errors="replace").strip()
+        except Exception:
+            self._ytdlp_version = None
+        return self._ytdlp_version
+
+    @staticmethod
+    def classify_youtube_error(stderr: str, stdout: str) -> tuple[str, str, bool]:
+        """Returns (failure_category, human_message, route_specific)."""
+        text = (stderr + "\n" + stdout).lower()
+        if "sign in to confirm you're not a bot" in text or "not a bot" in text:
+            return FailureCategory.RATE_LIMITED, "Target rejected the route as automated traffic.", True
+        if "the page needs to be reloaded" in text:
+            return FailureCategory.TARGET_UNAVAILABLE, "Target requested a reload for this route.", False
+        if "video unavailable" in text or "not available" in text:
+            return FailureCategory.TARGET_UNAVAILABLE, "Test content unavailable from this route (geo).", True
+        if "confirm your age" in text or "age-restricted" in text:
+            return FailureCategory.TARGET_UNAVAILABLE, "Target requires an age gate.", False
+        if "authentication" in text and "proxy" in text:
+            return FailureCategory.PROXY_AUTH_FAILURE, "Proxy authentication failed.", True
+        if "javascript" in text or "deno" in text or "ejs" in text:
+            return FailureCategory.ENVIRONMENT_ERROR, "Local JS extraction environment failed.", False
+        if "timed out" in text or "timeout" in text:
+            return FailureCategory.CONNECTION_TIMEOUT, "yt-dlp timed out.", True
+        if "name or service not known" in text or "getaddrinfo" in text:
+            return FailureCategory.DNS_FAILURE, "DNS resolution failed through this route.", True
+        if any(k in text for k in ("proxyerror", "connection reset", "connection refused")):
+            return FailureCategory.CONNECTION_REFUSED, "The proxy route failed during extraction.", True
+        if "yt-dlp" in text and "error" in text:
+            return FailureCategory.EXTRACTION_FAILURE, "yt-dlp reported an extraction error.", False
+        return FailureCategory.UNKNOWN, short_error(stderr or stdout), False
+
+    async def test_youtube(self, entry: ProxyEntry, target_url: str) -> dict[str, Any]:
+        proxy_url = entry.canonical
+        started = time.monotonic()
+        version = await self.get_ytdlp_version()
+
+        if not shutil.which(Config.YTDLP_BINARY) and not Path(Config.YTDLP_BINARY).exists():
+            return {
+                "state": ProxyState.ENVIRONMENT_ERROR,
+                "error_category": FailureCategory.ENVIRONMENT_ERROR,
+                "error": f"yt-dlp binary not found: {Config.YTDLP_BINARY}",
+                "duration": time.monotonic() - started,
+            }
+
+        command = [
+            Config.YTDLP_BINARY, "--dump-single-json", "--skip-download", "--no-playlist",
+            "--no-warnings", "--quiet",
+            "--socket-timeout", str(Config.YOUTUBE_TIMEOUT),
+            "--retries", "0", "--fragment-retries", "0",
+            "--proxy", proxy_url, "--user-agent", Config.USER_AGENT,
+        ]
+        deno_path = shutil.which("deno")
+        if deno_path:
+            command += ["--js-runtimes", f"deno:{deno_path}"]
+        if Config.YTDLP_REMOTE_COMPONENTS:
+            command += ["--remote-components", Config.YTDLP_REMOTE_COMPONENTS]
+        command += ["--", target_url]
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=Config.YOUTUBE_TIMEOUT + 10)
+            out = stdout.decode("utf-8", errors="replace")
+            err = stderr.decode("utf-8", errors="replace")
+            duration = time.monotonic() - started
+
+            if process.returncode == 0:
+                try:
+                    info = json.loads(out)
+                except json.JSONDecodeError:
+                    info = {}
+                formats = info.get("formats") or []
+                title = info.get("title") or ""
+                if formats and title:
+                    return {
+                        "state": ProxyState.YOUTUBE_WORKING,
+                        "error_category": FailureCategory.SUCCESS,
+                        "duration": duration, "latency_ms": duration * 1000.0,
+                        "formats_found": min(len(formats), Config.MAX_YTDLP_FORMATS),
+                        "yt_dlp_version": version, "title": title[:250],
+                    }
+                return {
+                    "state": ProxyState.YOUTUBE_REJECTED,
+                    "error_category": FailureCategory.EXTRACTION_FAILURE,
+                    "error": "yt-dlp returned no usable formats/title.",
+                    "duration": duration, "latency_ms": duration * 1000.0,
+                }
+
+            category, human, route_specific = self.classify_youtube_error(err, out)
+            state = ProxyState.TIMEOUT if category == FailureCategory.CONNECTION_TIMEOUT else (
+                ProxyState.ENVIRONMENT_ERROR if category in FailureCategory.NON_ROUTE_SPECIFIC
+                else ProxyState.YOUTUBE_REJECTED
+            )
+            return {
+                "state": state, "error_category": category, "error": human,
+                "raw_error": short_error(err, 1400), "route_specific": route_specific,
+                "duration": duration, "latency_ms": duration * 1000.0, "yt_dlp_version": version,
+            }
+        except asyncio.TimeoutError:
+            duration = time.monotonic() - started
+            return {"state": ProxyState.TIMEOUT, "error_category": FailureCategory.CONNECTION_TIMEOUT,
+                     "error": "yt-dlp test process timed out.", "duration": duration,
+                     "latency_ms": duration * 1000.0, "yt_dlp_version": version}
+        except Exception as exc:
+            return {"state": ProxyState.ENVIRONMENT_ERROR, "error_category": FailureCategory.ENVIRONMENT_ERROR,
+                     "error": short_error(exc), "duration": time.monotonic() - started, "yt_dlp_version": version}
+
+    # --- stage 4: optional, disabled-by-default Instagram connectivity -----
+
+    async def test_instagram(self, entry: ProxyEntry) -> Optional[bool]:
+        """Purely a connectivity check: can this route reach a public
+        Instagram page over HTTPS? No login, no session, no automation of
+        Instagram's product surface - just a reachability probe, matching
+        the same shape as the generic connectivity check."""
+        if not Config.INSTAGRAM_VALIDATION_ENABLED:
+            return None
+        proxy_url = entry.canonical
+        try:
+            timeout = aiohttp.ClientTimeout(total=Config.INSTAGRAM_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": Config.USER_AGENT}) as session:
+                async with session.get(Config.INSTAGRAM_TEST_URL, proxy=proxy_url, allow_redirects=True) as response:
+                    return response.status < 500
+        except Exception:
+            return False
+
+    # --- orchestration -------------------------------------------------------
+
+    async def validate(self, proxy: dict[str, Any], test_url: str) -> dict[str, Any]:
+        entry = ProxyEntry(
+            scheme=proxy.get("scheme", "http"),
+            host=proxy["host"], port=safe_int(proxy["port"]),
+            username=proxy.get("username"), password=proxy.get("password"),
+        )
+
+        # Stage 1: cheapest possible check - pure TCP, no bandwidth at all.
+        reachable = await self.tcp_connect_check(entry)
+        if not reachable:
+            return {"state": ProxyState.CONNECTION_FAILED, "error_category": FailureCategory.CONNECTION_TIMEOUT,
+                     "error": "TCP connect to proxy failed.", "generic_ok": False}
+
+        # Stage 2: generic HTTP check + exit IP - skipped for country lookup
+        # if the source already told us the country (bandwidth optimization).
+        known_country = proxy.get("source_country") or proxy.get("verified_country")
+        generic = await self.generic_check_and_ip(entry)
+        if not generic.get("generic_ok"):
+            return {"state": ProxyState.CONNECTION_FAILED, "generic_ok": False, **generic}
+
+        country_info: dict[str, Any] = {}
+        if not known_country:
+            country_info = await self.resolve_country(generic.get("exit_ip", ""))
+        else:
+            country_info = {"country_code": known_country}
+
+        # Stage 3: YouTube - the primary, decisive validation target.
+        yt = await self.test_youtube(entry, test_url)
+
+        result: dict[str, Any] = {
+            "generic_ok": True,
+            "latency_ms": generic.get("latency_ms"),
+            **country_info,
+            **yt,
+        }
+
+        # Stage 4: optional Instagram check, only runs if working on YouTube
+        # or explicitly enabled - avoids extra requests when disabled.
+        if Config.INSTAGRAM_VALIDATION_ENABLED:
+            result["instagram_working"] = await self.test_instagram(entry)
+
+        return result
+
+
+# ============================================================================
+# WORKER STATE / SCHEDULER
+# ============================================================================
+
+class WorkerState:
+    def __init__(self) -> None:
+        self.started_at = now_utc()
+        self.stop_event = asyncio.Event()
+        self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=Config.MAX_PENDING_TESTS)
+        self.pending_ids: set[str] = set()
+        self.pending_lock = asyncio.Lock()
+        self.tasks: set[asyncio.Task] = set()
+        self.active_tests = 0
+        self.completed_tests = 0
+        self.successful_tests = 0
+        self.failed_tests = 0
+        self.last_source_refresh: Optional[datetime] = None
+        self.last_working_pool_count = 0
+        self.critical_since: Optional[datetime] = None
+        self.last_error: Optional[str] = None
+        self.last_test_target_health = True
+        self.test_target_checked_at: Optional[datetime] = None
+        self.scheduler_running = False
+        self.report_last_sent: Optional[datetime] = None
+
+    def uptime_seconds(self) -> int:
+        return int((now_utc() - self.started_at).total_seconds())
+
+    def pool_health(self) -> str:
+        if self.last_working_pool_count <= 0:
+            return "CRITICAL"
+        if self.last_working_pool_count < 5:
+            return "LOW"
+        return "OK"
+
+
+class WorkerScheduler:
+    """Single coarse-grained scheduler loop (Code A's model, kept
+    deliberately - NOT Code B's 10-second tight loop). Everything expensive
+    (source fetch, revalidation, quarantine recheck, history cleanup) is
+    driven from one periodic tick at SOURCE_REFRESH_SECONDS. A separate
+    lightweight dispatcher just drains the bounded test queue with bounded
+    concurrency."""
+
+    def __init__(self, db: Database, sources: ProxySourceManager, validator: ProxyValidator,
+                 reports: "ReportManager", state: WorkerState, notify) -> None:
+        self.db = db
+        self.sources = sources
+        self.validator = validator
+        self.reports = reports
+        self.state = state
+        self.notify = notify
+        self.dispatcher_task: Optional[asyncio.Task] = None
+        self.periodic_task: Optional[asyncio.Task] = None
+        self.semaphore = asyncio.Semaphore(Config.TEST_CONCURRENCY)
+
+    async def start(self) -> None:
+        self.state.scheduler_running = True
+        self.dispatcher_task = asyncio.create_task(self.dispatch_loop(), name="proxy-dispatcher")
+        self.periodic_task = asyncio.create_task(self.periodic_loop(), name="proxy-periodic")
+
+    async def stop(self) -> None:
+        self.state.stop_event.set()
+        for task in (self.dispatcher_task, self.periodic_task):
+            if task:
+                task.cancel()
+        await asyncio.gather(self.dispatcher_task, self.periodic_task, return_exceptions=True)
+        for task in list(self.state.tasks):
+            task.cancel()
+        if self.state.tasks:
+            await asyncio.gather(*self.state.tasks, return_exceptions=True)
+        self.state.scheduler_running = False
+
+    # --- bounded dispatch queue ----------------------------------------------
+
+    async def enqueue_proxy(self, proxy_id: str, priority: int = 100, reason: str = "new") -> bool:
+        async with self.state.pending_lock:
+            if proxy_id in self.state.pending_ids:
+                return False
+            if self.state.queue.full():
+                logger.warning("[QUEUE] full; skipping proxy=%s reason=%s", proxy_id[:12], reason)
+                return False
+            self.state.pending_ids.add(proxy_id)
+            await self.state.queue.put((priority, time.monotonic(), proxy_id, reason))
+            return True
+
+    async def dispatch_loop(self) -> None:
+        logger.info("[SCHEDULER] dispatcher started")
+        while not self.state.stop_event.is_set():
+            try:
+                item = await asyncio.wait_for(self.state.queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            _, _, proxy_id, reason = item
+            async with self.state.pending_lock:
+                self.state.pending_ids.discard(proxy_id)
+            task = asyncio.create_task(self.run_proxy_test(proxy_id, reason), name=f"proxy-test-{proxy_id[:8]}")
+            self.state.tasks.add(task)
+            task.add_done_callback(self._task_done)
+
+    def _task_done(self, task: asyncio.Task) -> None:
+        self.state.tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("[TASK] proxy test task crashed")
+
+    async def run_proxy_test(self, proxy_id: str, reason: str) -> None:
+        # In-process claim (fast path) + DB lease (cross-process/cross-worker
+        # path) together prevent duplicate concurrent work on the same proxy,
+        # whether from this worker's own queue or a second worker instance
+        # sharing the same MongoDB.
+        claimed = await self.db.claim_proxy(proxy_id)
+        if not claimed:
+            return
+
+        async with self.semaphore:
+            self.state.active_tests += 1
+            try:
+                test_url = str(await self.db.get_config("youtube_test_url", Config.YOUTUBE_TEST_URL))
+                was_working = bool(claimed.get("ever_working")) and claimed.get("state") == ProxyState.YOUTUBE_WORKING
+                result = await self.validator.validate(claimed, test_url)
+                updated = await self.db.record_test_result(proxy_id, result)
+                self.state.completed_tests += 1
+
+                now_working = updated.get("state") == ProxyState.YOUTUBE_WORKING
+                if now_working:
+                    self.state.successful_tests += 1
+                elif result.get("error_category") not in FailureCategory.NON_ROUTE_SPECIFIC:
+                    self.state.failed_tests += 1
+
+                await self._notify_state_change(updated, was_working, now_working)
+            except Exception:
+                logger.exception("[TEST] proxy test crashed id=%s", proxy_id[:12])
+                await self.db.release_lease(proxy_id)
+            finally:
+                self.state.active_tests -= 1
+
+    async def _notify_state_change(self, proxy: dict[str, Any], was_working: bool, now_working: bool) -> None:
+        """Only notify on a meaningful transition, and only once per
+        transition (tracked via last_notified_state), to avoid spamming the
+        same result every scheduler cycle."""
+        proxy_id = proxy.get("proxy_id", "")
+        state = proxy.get("state")
+        last_notified = proxy.get("last_notified_state")
+
+        should_notify = False
+        headline = ""
+        if now_working and not was_working:
+            should_notify = True
+            headline = "🟢 Proxy recovered" if last_notified else "🟢 New working proxy"
+        elif state == ProxyState.PERMANENTLY_FAILED and last_notified != ProxyState.PERMANENTLY_FAILED:
+            should_notify = True
+            headline = "🔴 Proxy permanently failed"
+
+        if not should_notify or last_notified == state:
+            return
+
+        await self.db.proxies.update_one({"proxy_id": proxy_id}, {"$set": {"last_notified_state": state}})
+        proxy_str = mask_proxy_string(f"{proxy.get('scheme','http')}://{proxy.get('host','')}:{proxy.get('port','')}")
+        lines = [
+            headline,
+            f"Proxy: {proxy_str}",
+            f"Protocol: {proxy.get('scheme')}",
+            f"Status: {state}",
+            "Test target: YouTube",
+        ]
+        if proxy.get("latency_ms"):
+            lines.append(f"Latency: {int(proxy['latency_ms'])} ms")
+        if proxy.get("verified_country") or proxy.get("source_country"):
+            lines.append(f"Country: {proxy.get('verified_country') or proxy.get('source_country')}")
+        if proxy.get("source_ids"):
+            lines.append(f"Source: {', '.join(proxy['source_ids'][:3])}")
+        lines.append(f"Validated at: {now_utc().strftime('%Y-%m-%d %H:%M UTC')}")
+        await self.notify("\n".join(lines))
+
+    # --- queue population ------------------------------------------------------
+
+    async def enqueue_new_candidates(self, source_id: Optional[str] = None) -> int:
+        query: dict[str, Any] = {"retired": {"$ne": True}, "enabled": True, "state": ProxyState.NORMALIZED}
+        if source_id:
+            query["source_ids"] = source_id
+        added = 0
+        cursor = self.db.proxies.find(query).sort("first_seen_at", ASCENDING).limit(Config.MAX_TEST_PER_REFRESH)
+        async for doc in cursor:
+            if await self.enqueue_proxy(doc["proxy_id"], priority=10, reason="new"):
+                added += 1
+        return added
+
+    async def enqueue_revalidation(self) -> int:
+        now = now_utc()
+        query = {
+            "retired": {"$ne": True}, "enabled": True,
+            "state": ProxyState.YOUTUBE_WORKING,
+            "$or": [{"next_validation_at": None}, {"next_validation_at": {"$lte": now}}],
+        }
+        count = 0
+        cursor = self.db.proxies.find(query).sort("youtube_score", DESCENDING).limit(Config.MAX_TEST_PER_REFRESH)
+        async for doc in cursor:
+            if await self.enqueue_proxy(doc["proxy_id"], priority=30, reason="revalidation"):
+                count += 1
+        return count
+
+    async def enqueue_quarantine_rechecks(self) -> int:
+        query = {
+            "retired": {"$ne": True}, "enabled": True,
+            "state": ProxyState.QUARANTINED,
+            "quarantine_until": {"$lte": now_utc()},
+        }
+        count = 0
+        cursor = self.db.proxies.find(query).sort("quarantine_until", ASCENDING).limit(200)
+        async for doc in cursor:
+            if await self.enqueue_proxy(doc["proxy_id"], priority=40, reason="quarantine-expired"):
+                count += 1
+        return count
+
+    # --- source refresh -------------------------------------------------------
+
+    async def source_refresh_once(self) -> dict[str, Any]:
+        enabled_sources = await self.db.get_sources(enabled_only=True)
+        aggregate = Counter()
+
+        for source in enabled_sources:
+            interval = safe_int(source.get("fetch_interval"), Config.SOURCE_REFRESH_SECONDS)
+            last_checked = parse_dt(source.get("last_checked_at"))
+            if last_checked and (now_utc() - last_checked).total_seconds() < interval:
+                continue  # this specific source isn't due yet (per-source interval)
+
+            task_id = await self.db.create_task("SOURCE_REFRESH", source["source_id"])
+            await self.db.start_task(task_id)
+            try:
+                result = await self.sources.import_source(source, task_id)
+                aggregate["sources"] += 1
+                aggregate["fetched"] += safe_int(result.get("fetched"))
+                aggregate["valid"] += safe_int(result.get("valid"))
+                aggregate["new"] += safe_int(result.get("new"))
+                aggregate["duplicates"] += safe_int(result.get("duplicates"))
+                aggregate["invalid"] += safe_int(result.get("invalid"))
+
+                if not result.get("unchanged"):
+                    await self.enqueue_new_candidates(source["source_id"])
+
+                await self.db.finish_task(task_id, "COMPLETED", result_summary=result)
+            except Exception as exc:
+                await self.db.record_source_state(source["source_id"], success=False, error=short_error(exc))
+                await self.db.finish_task(task_id, "FAILED", error=short_error(exc))
+                logger.error("[SOURCE] %s failed: %s", source["source_id"], short_error(exc))
+
+                latest = await self.db.get_source(source["source_id"])
+                if latest and safe_int(latest.get("failure_count")) >= Config.SOURCE_FAILURE_ALERT_THRESHOLD:
+                    await self.notify(
+                        f"⚠️ Source failure threshold reached\nSource: {source['name']}\nError: {short_error(exc, 300)}"
+                    )
+
+        await self.enqueue_revalidation()
+        await self.enqueue_quarantine_rechecks()
+        self.state.last_source_refresh = now_utc()
+        return dict(aggregate)
+
+    async def check_test_target(self) -> bool:
+        target = str(await self.db.get_config("youtube_test_url", Config.YOUTUBE_TEST_URL))
+        self.state.test_target_checked_at = now_utc()
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": Config.USER_AGENT}) as session:
+                async with session.head(target, allow_redirects=True) as response:
+                    if response.status in {200, 301, 302, 303, 307, 308, 405}:
+                        self.state.last_test_target_health = True
+                        return True
+                async with session.get(target, allow_redirects=True) as response:
+                    self.state.last_test_target_health = response.status < 500
+                    return self.state.last_test_target_health
+        except Exception as exc:
+            logger.warning("[TARGET] health check failed: %s", short_error(exc))
+            self.state.last_test_target_health = False
+            return False
+
+    async def periodic_loop(self) -> None:
+        logger.info("[SCHEDULER] periodic loop started (interval=%ss)", Config.SOURCE_REFRESH_SECONDS)
+        first_run = True
+        while not self.state.stop_event.is_set():
+            try:
+                if first_run:
+                    first_run = False
+                else:
+                    await asyncio.sleep(Config.SOURCE_REFRESH_SECONDS)
+
+                # Keep Code A's safeguard: never bulk-test against a
+                # currently-unhealthy target, so we don't wrongly punish a
+                # large batch of otherwise-good proxies.
+                target_ok = await self.check_test_target()
+                if not target_ok:
+                    await self.notify("🟠 YouTube test target appears unhealthy. Bulk testing paused this cycle.")
+                else:
+                    try:
+                        summary = await self.source_refresh_once()
+                        logger.info(
+                            "[SOURCE] refresh sources=%s fetched=%s valid=%s new=%s dup=%s invalid=%s",
+                            summary.get("sources", 0), summary.get("fetched", 0), summary.get("valid", 0),
+                            summary.get("new", 0), summary.get("duplicates", 0), summary.get("invalid", 0),
+                        )
+                    except Exception:
+                        logger.exception("[SCHEDULER] refresh failed")
+
+                await self.db.release_expired_leases()
+                await self.db.retire_orphans(Config.ORPHAN_RETIRE_AFTER_SECONDS)
+                await self.db.cleanup_history(days=30)
+                await self.refresh_pool_health()
+                await self.maybe_daily_report()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.state.last_error = short_error(exc)
+                logger.exception("[SCHEDULER] periodic loop error")
+                await asyncio.sleep(5)
+
+    async def refresh_pool_health(self) -> str:
+        count = await self.db.proxies.count_documents(
+            {"enabled": True, "retired": {"$ne": True}, "state": ProxyState.YOUTUBE_WORKING}
+        )
+        old = self.state.last_working_pool_count
+        self.state.last_working_pool_count = count
+        health = self.state.pool_health()
+
+        if health == "CRITICAL":
+            if self.state.critical_since is None:
+                self.state.critical_since = now_utc()
+                await self.notify("🔴 CRITICAL: no verified YouTube-working proxy is currently available.")
+        else:
+            self.state.critical_since = None
+
+        if old > 0 and count == 0:
+            await self.notify("🔴 Proxy pool dropped to zero verified YouTube-working routes.")
+        return health
+
+    async def maybe_daily_report(self) -> None:
+        if not Config.REPORT_ENABLED:
+            return
+        current = now_utc()
+        already = await self.db.get_config("last_daily_report_date")
+        today = current.strftime("%Y-%m-%d")
+        if already == today:
+            return
+        if current.hour < Config.DAILY_REPORT_HOUR:
+            return
+        if current.hour == Config.DAILY_REPORT_HOUR and current.minute < Config.DAILY_REPORT_MINUTE:
+            return
+
+        summary = await self.reports.daily_summary()
+        await self.reports.persist_daily_summary(summary)
+        await self.notify(self.reports.format_daily_summary(summary))
+        await self.db.set_config("last_daily_report_date", today)
+        self.state.report_last_sent = now_utc()
+
+    async def test_specific(self, proxy_id: str) -> dict[str, Any]:
+        proxy = await self.db.get_proxy(proxy_id)
+        if not proxy:
+            return {"ok": False, "error": "Proxy not found."}
+        test_url = str(await self.db.get_config("youtube_test_url", Config.YOUTUBE_TEST_URL))
+        result = await self.validator.validate(proxy, test_url)
+        updated = await self.db.record_test_result(proxy_id, result)
+        return {"ok": True, **updated}
+
+
+# ============================================================================
+# REPORTS
+# ============================================================================
+
+class ReportManager:
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    async def system_stats(self) -> dict[str, Any]:
+        return await self.db.get_stats()
+
+    async def country_report(self) -> list[dict[str, Any]]:
+        pipeline = [
+            {"$match": {"state": ProxyState.YOUTUBE_WORKING, "enabled": True}},
+            {"$group": {"_id": "$verified_country", "working": {"$sum": 1}}},
+            {"$sort": {"working": -1}},
+            {"$limit": 20},
+        ]
+        return await self.db.proxies.aggregate(pipeline).to_list(length=20)
+
+    async def export_working(self, country: Optional[str] = None) -> bytes:
+        query: dict[str, Any] = {"state": ProxyState.YOUTUBE_WORKING, "enabled": True}
+        if country:
+            query["verified_country"] = country.upper()
+        lines = []
+        cursor = self.db.proxies.find(query).sort("youtube_score", DESCENDING).limit(5000)
+        async for doc in cursor:
+            entry = ProxyEntry(
+                scheme=doc.get("scheme", "http"), host=doc["host"], port=doc["port"],
+                username=doc.get("username"), password=doc.get("password"),
+            )
+            lines.append(entry.canonical)
+        return "\n".join(lines).encode("utf-8")
+
+    async def daily_summary(self) -> dict[str, Any]:
+        cutoff = now_utc() - timedelta(hours=24)
+        stats = await self.db.get_stats()
+        new_24h = await self.db.proxies.count_documents({"first_seen_at": {"$gte": cutoff}})
+        tested_24h = await self.db.proxies.count_documents({"last_tested_at": {"$gte": cutoff}})
+        working_24h = await self.db.proxies.count_documents({"last_success_at": {"$gte": cutoff}})
+        countries = await self.country_report()
+        pipeline = [
+            {"$match": {"state": ProxyState.YOUTUBE_WORKING, "latency_ms": {"$ne": None}}},
+            {"$group": {"_id": None, "avg": {"$avg": "$latency_ms"}}},
+        ]
+        avg_result = await self.db.proxies.aggregate(pipeline).to_list(length=1)
+        avg_latency = safe_int(avg_result[0]["avg"]) if avg_result else 0
+
+        return {
+            "total": stats["total"], "working": stats["working"],
+            "new_24h": new_24h, "tested_24h": tested_24h, "working_24h": working_24h,
+            "avg_latency_ms": avg_latency, "countries": countries,
+        }
+
+    async def persist_daily_summary(self, summary: dict[str, Any]) -> None:
+        date_key = now_utc().strftime("%Y-%m-%d")
+        await self.db.daily.update_one({"date": date_key}, {"$set": {**summary, "date": date_key}}, upsert=True)
+
+    @staticmethod
+    def format_daily_summary(summary: dict[str, Any]) -> str:
+        lines = [
+            "📊 DAILY WORKER REPORT", "",
+            f"🌐 Total known: {summary.get('total', 0)}",
+            f"🆕 New (24h): {summary.get('new_24h', 0)}",
+            f"🧪 Tested (24h): {summary.get('tested_24h', 0)}",
+            f"🟢 Working (24h): {summary.get('working_24h', 0)}",
+            f"📈 Current working pool: {summary.get('working', 0)}",
+            f"⏱️ Average latency: {summary.get('avg_latency_ms', 0)} ms",
+        ]
+        countries = summary.get("countries") or []
+        if countries:
+            lines.append("")
+            lines.append("Top countries:")
+            for row in countries[:10]:
+                lines.append(f"{row.get('_id') or 'UNKNOWN'}: working={row.get('working', 0)}")
+        return "\n".join(lines)
+
+
+# ============================================================================
+# TELEGRAM ADMIN UI
+# ============================================================================
+
+class TelegramAdminUI:
+    def __init__(self, db: Database, sources: ProxySourceManager, scheduler: WorkerScheduler,
+                 reports: ReportManager, state: WorkerState) -> None:
+        self.db = db
+        self.sources = sources
+        self.scheduler = scheduler
+        self.reports = reports
+        self.state = state
+        self.bot: Optional[Client] = None
+        self._pending_input: dict[int, str] = {}
+
+    def authorized(self, user_id: int) -> bool:
+        return user_id == Config.OWNER_ID
+
+    async def notify(self, text: str) -> None:
+        if not self.bot:
+            return
+        try:
+            await self.bot.send_message(Config.ADMIN_CHAT_ID, text)
+        except FloodWait as exc:
+            await asyncio.sleep(getattr(exc, "value", 5))
+            try:
+                await self.bot.send_message(Config.ADMIN_CHAT_ID, text)
+            except Exception:
+                logger.exception("[TG] notify retry failed")
+        except Exception:
+            logger.exception("[TG] notify failed")
+
+    def dashboard_markup(self):
+        if InlineKeyboardMarkup is None:
+            return None
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📊 Stats", callback_data="stats"),
+                 InlineKeyboardButton("🌍 Countries", callback_data="countries")],
+                [InlineKeyboardButton("🗂 Sources", callback_data="sources"),
+                 InlineKeyboardButton("➕ Add source", callback_data="add_source")],
+                [InlineKeyboardButton("🔁 Refresh now", callback_data="refresh_now"),
+                 InlineKeyboardButton("📤 Export working", callback_data="export")],
+                [InlineKeyboardButton("⚙️ Health", callback_data="health")],
+            ]
+        )
+
+    async def send_dashboard(self, message: Message) -> None:
+        text = (
+            "🤖 Proxy Worker Bot\n\n"
+            f"Uptime: {self.state.uptime_seconds() // 60} min\n"
+            f"Pool health: {self.state.pool_health()}\n"
+            f"Working pool: {self.state.last_working_pool_count}"
+        )
+        await message.reply_text(text, reply_markup=self.dashboard_markup())
+
+    async def setup(self) -> None:
+        if Client is None:
+            logger.warning("[TG] pyrogram not available; Telegram admin UI disabled.")
+            return
+        self.bot = Client(
+            "proxy_worker_bot", bot_token=Config.BOT_TOKEN,
+            api_id=env_int("API_ID", 0), api_hash=os.getenv("API_HASH", "").strip(),
+            in_memory=True,
+        )
+
+        @self.bot.on_message(filters.command("start") & filters.private)
+        async def _start(_, message: Message):
+            if not self.authorized(message.from_user.id):
+                return
+            await self.send_dashboard(message)
+
+        @self.bot.on_message(filters.command("add_source") & filters.private)
+        async def _add_source(_, message: Message):
+            if not self.authorized(message.from_user.id):
+                return
+            parts = message.text.split(maxsplit=1)
+            if len(parts) < 2:
+                await message.reply_text(
+                    "Usage: /add_source <url> [name]\n\n"
+                    "Supports direct TXT/JSON/CSV URLs and GitHub blob/tree URLs."
+                )
+                return
+            rest = parts[1].strip().split(maxsplit=1)
+            url = rest[0]
+            name = rest[1] if len(rest) > 1 else urlparse(url).netloc or url
+            source_id = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+            try:
+                preview = await self.sources.preview(url)
+            except Exception as exc:
+                await message.reply_text(f"❌ Could not fetch/parse source: {short_error(exc, 300)}")
+                return
+            await self.db.upsert_source(
+                {
+                    "source_id": source_id, "name": name, "url": url,
+                    "source_type": "MANUAL", "enabled": True,
+                    "country": None, "protocol": None,
+                    "priority": 200, "fetch_interval": Config.SOURCE_REFRESH_SECONDS,
+                }
+            )
+            await message.reply_text(
+                f"✅ Source added: {name}\n"
+                f"Resolved format: {preview['format']}\n"
+                f"Estimated entries: {preview['estimated_entries']}\n"
+                f"This source will now be treated as a configured, automatically-refreshed source "
+                f"(every {Config.SOURCE_REFRESH_SECONDS}s by default)."
+            )
+
+        @self.bot.on_message(filters.command("sources") & filters.private)
+        async def _sources(_, message: Message):
+            if not self.authorized(message.from_user.id):
+                return
+            await self.send_sources(message)
+
+        @self.bot.on_message(filters.command("stats") & filters.private)
+        async def _stats(_, message: Message):
+            if not self.authorized(message.from_user.id):
+                return
+            stats = await self.reports.system_stats()
+            await message.reply_text(
+                "📊 Stats\n" + "\n".join(f"{k}: {v}" for k, v in stats.items())
+            )
+
+        @self.bot.on_message(filters.command("refresh_now") & filters.private)
+        async def _refresh(_, message: Message):
+            if not self.authorized(message.from_user.id):
+                return
+            await message.reply_text("Running source refresh now...")
+            summary = await self.scheduler.source_refresh_once()
+            await message.reply_text(f"Done: {summary}")
+
+        @self.bot.on_message(filters.command("test") & filters.private)
+        async def _test(_, message: Message):
+            if not self.authorized(message.from_user.id):
+                return
+            parts = message.text.split(maxsplit=1)
+            if len(parts) < 2:
+                await message.reply_text("Usage: /test <proxy_id>")
+                return
+            result = await self.scheduler.test_specific(parts[1].strip())
+            await message.reply_text(f"Result: {json.dumps({k: v for k, v in result.items() if k != '_id'}, default=str)[:3500]}")
+
+        @self.bot.on_message(filters.command("export") & filters.private)
+        async def _export(_, message: Message):
+            if not self.authorized(message.from_user.id):
+                return
+            data = await self.reports.export_working()
+            path = f"/tmp/working_proxies_{int(time.time())}.txt"
+            with open(path, "wb") as fh:
+                fh.write(data)
+            await message.reply_document(path, caption="Verified YouTube-working proxies")
+
+        @self.bot.on_callback_query()
+        async def _callback(_, callback: CallbackQuery):
+            if not self.authorized(callback.from_user.id):
+                await callback.answer("Unauthorized", show_alert=True)
+                return
+            data = callback.data
+            if data == "stats":
+                stats = await self.reports.system_stats()
+                await callback.message.edit_text(
+                    "📊 Stats\n" + "\n".join(f"{k}: {v}" for k, v in stats.items()),
+                    reply_markup=self.dashboard_markup(),
+                )
+            elif data == "countries":
+                rows = await self.reports.country_report()
+                text = "🌍 Countries\n" + "\n".join(
+                    f"{r.get('_id') or 'UNKNOWN'}: {r.get('working', 0)}" for r in rows
+                ) or "No data yet."
+                await callback.message.edit_text(text, reply_markup=self.dashboard_markup())
+            elif data == "sources":
+                await self.send_sources(callback.message)
+            elif data == "add_source":
+                await callback.message.reply_text("Send: /add_source <url> [name]")
+            elif data == "refresh_now":
+                await callback.answer("Refreshing...")
+                summary = await self.scheduler.source_refresh_once()
+                await callback.message.reply_text(f"Refresh done: {summary}")
+            elif data == "export":
+                data_bytes = await self.reports.export_working()
+                path = f"/tmp/working_proxies_{int(time.time())}.txt"
+                with open(path, "wb") as fh:
+                    fh.write(data_bytes)
+                await callback.message.reply_document(path, caption="Verified YouTube-working proxies")
+            elif data == "health":
+                await callback.message.edit_text(await self.health_text(), reply_markup=self.dashboard_markup())
+            await callback.answer()
+
+    async def send_sources(self, message: Message) -> None:
+        sources = await self.db.get_sources()
+        if not sources:
+            await message.reply_text("No sources configured yet. Use /add_source <url> [name].")
+            return
+        lines = ["🗂 Configured sources:"]
+        for src in sources:
+            status = "✅" if src.get("enabled") else "⛔"
+            lines.append(
+                f"{status} {src.get('name')} | fmt={src.get('resolved_format') or '?'} "
+                f"| last_items={src.get('last_item_count', 0)} | fails={src.get('failure_count', 0)}"
+            )
+        await message.reply_text("\n".join(lines))
+
+    async def health_text(self) -> str:
+        stats = await self.reports.system_stats()
+        db_ok = await self.db.ping()
+        return (
+            "⚙️ Health\n"
+            f"Mongo: {'OK' if db_ok else 'DOWN'}\n"
+            f"Pool health: {self.state.pool_health()}\n"
+            f"Working: {stats['working']} / Total: {stats['total']}\n"
+            f"Active tests: {self.state.active_tests}\n"
+            f"Target healthy: {self.state.last_test_target_health}"
+        )
+
+    async def start(self) -> None:
+        if not self.bot:
+            return
+        await self.bot.start()
+        logger.info("[TG] admin bot started")
+
+    async def stop(self) -> None:
+        if self.bot:
+            try:
+                await self.bot.stop()
+            except Exception:
+                pass
+
+
+# ============================================================================
+# HEALTH SERVER
+# ============================================================================
+
+class HealthServer:
+    def __init__(self, db: Database, state: WorkerState) -> None:
+        self.db = db
+        self.state = state
+        self.app = web.Application()
+        self.app.add_routes([
+            web.get("/", self.root),
+            web.get("/health", self.health),
+            web.get("/ready", self.ready),
+        ])
+        self.runner: Optional[web.AppRunner] = None
+
+    async def root(self, request: web.Request) -> web.Response:
+        return web.json_response({"service": "proxy-worker-bot", "status": "running"})
+
+    async def health(self, request: web.Request) -> web.Response:
+        db_ok = await self.db.ping()
+        status = 200 if db_ok else 503
+        return web.json_response(
+            {
+                "status": "ok" if db_ok else "degraded",
+                "mongo": db_ok,
+                "uptime_seconds": self.state.uptime_seconds(),
+                "scheduler_running": self.state.scheduler_running,
+                "pool_health": self.state.pool_health(),
+                "working_pool": self.state.last_working_pool_count,
+                "active_tests": self.state.active_tests,
+                "target_healthy": self.state.last_test_target_health,
+            },
+            status=status,
+        )
+
+    async def ready(self, request: web.Request) -> web.Response:
+        ok = await self.db.ping() and self.state.scheduler_running
+        return web.json_response({"ready": ok}, status=200 if ok else 503)
+
+    async def start(self) -> None:
+        self.runner = web.AppRunner(self.app)
+        await self.runner.setup()
+        site = web.TCPSite(self.runner, "0.0.0.0", Config.PORT)
+        await site.start()
+        logger.info("[HEALTH] server listening on 0.0.0.0:%s", Config.PORT)
+
+    async def stop(self) -> None:
         if self.runner:
             await self.runner.cleanup()
 
 
-# ======================================================================
-# MAIN APPLICATION
-# ======================================================================
-class ProxyWorkerBot:
-    def __init__(self):
-        self.config = config
-        self.db = None
-        self.bot = None
-        self.session = None
-        self.source_manager = None
-        self.proxy_repo = None
-        self.tester = None
-        self.scheduler = None
-        self.report_manager = None
-        self.alert_manager = None
-        self.telegram_ui = None
-        self.health_server = None
+# ============================================================================
+# APPLICATION
+# ============================================================================
 
-    async def initialize(self):
-        # Validate config
-        if not self.config.validate():
-            logger.critical("Invalid configuration")
-            sys.exit(1)
+class Application:
+    def __init__(self) -> None:
+        self.db = Database()
+        self.sources = ProxySourceManager(self.db)
+        self.validator = ProxyValidator()
+        self.reports = ReportManager(self.db)
+        self.state = WorkerState()
+        self.admin_ui = TelegramAdminUI(self.db, self.sources, None, self.reports, self.state)  # scheduler set below
+        self.scheduler = WorkerScheduler(self.db, self.sources, self.validator, self.reports, self.state,
+                                          notify=self.admin_ui.notify)
+        self.admin_ui.scheduler = self.scheduler
+        self.health_server = HealthServer(self.db, self.state)
 
-        # Connect MongoDB
-        self.config.mongo_client = motor.motor_asyncio.AsyncIOMotorClient(self.config.MONGO_URI)
-        self.db = self.config.mongo_client[self.config.MONGO_DB_NAME]
-        self.config.db = self.db
-        await ensure_indexes()
-        logger.info("Connected to MongoDB")
-
-        # Create aiohttp session
-        self.session = aiohttp.ClientSession()
-
-        # Initialize components
-        self.proxy_repo = ProxyRepository(self.db)
-        self.source_manager = ProxySourceManager(self.db, self.session)
-        self.tester = ProxyTester(self.db, self.session)
-        self.report_manager = ReportManager(self.db, self.bot, self.config)
-        self.alert_manager = AlertManager(self.bot, self.config.OWNER_ID)
-
-        # Initialize default sources
-        await self.source_manager.initialize_default_sources()
-
-        # Initialize scheduler
-        self.scheduler = WorkerScheduler(
-            self.db,
-            self.source_manager,
-            self.tester,
-            self.bot,
-            self.report_manager,
-            self.alert_manager
-        )
-
-        # Initialize Telegram bot
-        self.bot = AsyncTeleBot(self.config.BOT_TOKEN)
-        self.config.bot = self.bot
-
-        # Set report manager bot (it was None before)
-        self.report_manager.bot = self.bot
-        self.alert_manager.bot = self.bot
-
-        # Set up Telegram UI
-        self.telegram_ui = TelegramAdminUI(
-            self.bot,
-            self.db,
-            self.config,
-            self.scheduler,
-            self.source_manager,
-            self.tester,
-            self.report_manager,
-            self.alert_manager
-        )
-        await self.telegram_ui.setup_handlers()
-
-        # Set up health server
-        self.health_server = HealthServer(self.config, self.db, self.scheduler)
-
-        # Set scheduler's bot reference
-        self.scheduler.bot = self.bot
-
-        # Start health server
+    async def start(self) -> None:
+        Config.validate()
+        await self.db.connect()
+        await self.db.initialize_defaults()
+        await self.sources.start()
+        await self.validator.start()
+        await self.admin_ui.setup()
+        await self.admin_ui.start()
         await self.health_server.start()
-
-        # Start scheduler
         await self.scheduler.start()
 
-        # Send startup notification
         try:
-            await self.bot.send_message(
-                self.config.OWNER_ID,
-                "🟢 Proxy Worker Bot started."
+            await self.admin_ui.notify(
+                "🟢 Proxy Worker Bot v2 started.\n"
+                "Foundation: Code A architecture, restart-safe, permanent working-proxy retention."
             )
-        except Exception as e:
-            logger.error(f"Failed to send startup notification: {e}")
+        except Exception:
+            logger.exception("[APP] startup notification failed")
 
-        # Schedule daily report task
-        asyncio.create_task(self._daily_report_loop())
+        logger.info("[APP] initialization complete")
 
-        logger.info("Worker initialization complete")
+    async def stop(self) -> None:
+        logger.info("[APP] shutting down...")
+        await self.scheduler.stop()
+        await self.health_server.stop()
+        await self.admin_ui.stop()
+        await self.validator.close()
+        await self.sources.close()
+        await self.db.close()
+        logger.info("[APP] shutdown complete")
 
-    async def _daily_report_loop(self):
-        while True:
-            await asyncio.sleep(60 * 60)  # check every hour
-            now = utcnow()
-            if now.hour == self.config.DAILY_REPORT_HOUR:
-                await self.report_manager.send_daily_report()
-                # sleep to avoid sending multiple times in same hour
-                await asyncio.sleep(3600)
+    async def run(self) -> None:
+        await self.start()
+        stop_signal = asyncio.Event()
 
-    async def run(self):
-        await self.initialize()
-        # Use infinity_polling for better resilience against conflicts
-        # Removed unsupported 'long_polling_timeout' argument
-        await self.bot.infinity_polling(timeout=10)
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop_signal.set)
+            except NotImplementedError:
+                pass  # signal handlers unsupported on this platform (e.g. some Windows setups)
 
-    async def shutdown(self, sig=None):
-        """Graceful shutdown."""
-        logger.info("Shutting down...")
-        if self.scheduler:
-            await self.scheduler.stop()
-        if self.health_server:
-            await self.health_server.stop()
-        if self.session:
-            await self.session.close()
-        if self.config.mongo_client:
-            self.config.mongo_client.close()
-        logger.info("Shutdown complete")
-        sys.exit(0)
+        await stop_signal.wait()
+        await self.stop()
 
 
-# ======================================================================
+# ============================================================================
 # ENTRY POINT
-# ======================================================================
-async def main():
-    worker = ProxyWorkerBot()
+# ============================================================================
+
+async def main() -> None:
+    app = Application()
     try:
-        await worker.run()
+        await app.run()
     except (KeyboardInterrupt, SystemExit):
-        await worker.shutdown()
-    except Exception as e:
-        logger.critical(f"Fatal error: {e}")
-        await worker.shutdown()
+        await app.stop()
+    except Exception:
+        logger.critical("Fatal error", exc_info=True)
+        await app.stop()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
