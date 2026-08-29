@@ -5,9 +5,12 @@ FROM python:3.12-slim
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install system dependencies:
+# - gcc and python3-dev: Required to build tgcrypto wheel
 # - ffmpeg: Sometimes required by yt-dlp for media operations
 # - curl & unzip: Required to download and install Deno
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    python3-dev \
     ffmpeg \
     curl \
     unzip \
