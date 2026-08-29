@@ -2016,7 +2016,82 @@ class WorkerScheduler:
         updated = await self.db.record_test_result(proxy_id, result)
         return {"ok": True, **updated}
 
+    async def trigger_pool_refresh(self) -> None:
+        """Stops current queue and starts a strict double-check on working proxies."""
+        # 1. Fetch currently working proxies from the database
+        working_proxies = await self.db.proxies.find(
+            {"state": ProxyState.YOUTUBE_WORKING, "enabled": True}
+        ).to_list(length=None)
+        
+        if not working_proxies:
+            await self.notify("♻️ Pool Refresh cancelled: No working proxies found in the pool to check.")
+            return
 
+        # 2. Stop other background queue tasks by clearing the queue completely
+        async with self.state.pending_lock:
+            while not self.state.queue.empty():
+                try:
+                    self.state.queue.get_nowait()
+                    self.state.queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+            self.state.pending_ids.clear()
+            
+        await self.notify(f"♻️ Pool Refresh started for {len(working_proxies)} proxies. Other background tasks have been paused.")
+        
+        # 3. Start the double-check process in the background
+        import asyncio
+        asyncio.create_task(self._run_pool_refresh_task(working_proxies))
+
+    async def _run_pool_refresh_task(self, proxies: list) -> None:
+        """Executes the double-check logic with concurrency limits."""
+        initial_count = len(proxies)
+        final_working_count = 0
+        test_url = str(await self.db.get_config("youtube_test_url", Config.YOUTUBE_TEST_URL))
+        
+        import asyncio
+        async def check_proxy_with_retry(proxy_doc):
+            nonlocal final_working_count
+            proxy_id = proxy_doc["proxy_id"]
+            
+            async with self.semaphore:  # Prevent server crash by using existing limit
+                self.state.active_tests += 1
+                try:
+                    # TEST 1: First attempt
+                    result = await self.validator.validate(proxy_doc, test_url)
+                    
+                    # DOUBLE CHECK LOGIC: If Test 1 fails, wait 2 seconds and try exactly once more
+                    if result.get("state") != ProxyState.YOUTUBE_WORKING:
+                        await asyncio.sleep(2) 
+                        result = await self.validator.validate(proxy_doc, test_url)
+                    
+                    # Update DB (This will automatically move it to QUARANTINED if it failed both times)
+                    updated = await self.db.record_test_result(proxy_id, result)
+                    
+                    # If it passed either Test 1 or the Double Check
+                    if updated.get("state") == ProxyState.YOUTUBE_WORKING:
+                        final_working_count += 1
+                        
+                except Exception as e:
+                    logger.exception(f"[POOL REFRESH] Error testing proxy {proxy_id[:8]}")
+                finally:
+                    self.state.active_tests -= 1
+
+        # Run all tests concurrently
+        tasks = [asyncio.create_task(check_proxy_with_retry(p)) for p in proxies]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
+        # Send Final Report
+        report = (
+            "♻️ **Pool Refresh Report**\n\n"
+            f"Previous Working Pool: {initial_count}\n"
+            f"Currently Working: {final_working_count}\n"
+            f"Removed (Failed Double-Check): {initial_count - final_working_count}\n\n"
+            "Normal background tasks will now resume automatically."
+        )
+        await self.notify(report)
+        
 # ============================================================================
 # REPORTS
 # ============================================================================
@@ -2138,7 +2213,8 @@ class TelegramAdminUI:
                  InlineKeyboardButton("➕ Add source", callback_data="add_source")],
                 [InlineKeyboardButton("🔁 Refresh now", callback_data="refresh_now"),
                  InlineKeyboardButton("📤 Export working", callback_data="export")],
-                [InlineKeyboardButton("⚙️ Health", callback_data="health")],
+                [InlineKeyboardButton("⚙️ Health", callback_data="health"),
+                 InlineKeyboardButton("♻️ Pool Refresh", callback_data="pool_refresh_prompt")],
             ]
         )
 
@@ -2282,6 +2358,30 @@ class TelegramAdminUI:
             elif data == "health":
                 await callback.message.edit_text(await self.health_text(), reply_markup=self.dashboard_markup())
             await callback.answer()
+            
+            
+        @self.bot.on_callback_query
+        
+            elif data == "pool_refresh_prompt":
+                markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Yes, Refresh Pool", callback_data="pool_refresh_confirm")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="pool_refresh_cancel")]
+                ])
+                await callback.message.edit_text(
+                    "⚠️ **Are you sure?**\n\nThis will stop all current background tasks, extract all currently working proxies, and double-check them immediately.",
+                    reply_markup=markup
+                )
+            elif data == "pool_refresh_cancel":
+                # Go back to the main dashboard
+                await callback.message.edit_text("❌ Pool Refresh cancelled.")
+                await self.send_dashboard(callback.message)
+            elif data == "pool_refresh_confirm":
+                await callback.message.edit_text("♻️ **Pool Refresh initiated.**\n\nStopping other tasks and starting the double-check process. Please wait for the report...")
+                # Trigger the background refresh task in Scheduler
+                import asyncio
+                asyncio.create_task(self.scheduler.trigger_pool_refresh())
+            
+            await callback.answer()    
 
     async def send_sources(self, message: Message) -> None:
         sources = await self.db.get_sources()
