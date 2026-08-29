@@ -1,13 +1,14 @@
-# MongoDB Async Driver (includes pymongo)
-motor>=3.6.0
+# MongoDB Async Native Driver (replaces motor)
 pymongo>=4.10.1
 dnspython>=2.7.0
 
-# Telegram API
-pyTelegramBotAPI>=4.26.0
+# Telegram API (Changed from pyTelegramBotAPI to pyrogram as per main.py v2)
+pyrogram>=2.0.106
+tgcrypto>=1.2.5
 
-# Async Web & HTTP Client
+# Async Web, HTTP Client & SOCKS Proxy Support
 aiohttp>=3.11.11
+aiohttp-socks>=0.10.1
 
 # YouTube Extraction - ALWAYS fetch the absolute latest version
 yt-dlp
