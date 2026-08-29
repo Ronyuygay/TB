@@ -691,7 +691,7 @@ class Database:
 
     async def close(self) -> None:
         if self.client:
-            self.client.close()
+            await self.client.close()
             self.client = None
             logger.info("[DB] MongoDB closed")
 
