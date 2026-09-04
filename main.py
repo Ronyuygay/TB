@@ -81,12 +81,13 @@ def env_bool(name: str, default: bool) -> bool:
     return val.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def env_int(name: str, default: int, minimum: int = 0, maximum: Optional[int] = None) -> int:
+def env_int(name: str, default: int, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
     try:
         val = int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         val = default
-    val = max(minimum, val)
+    if minimum is not None:
+        val = max(minimum, val)
     if maximum is not None:
         val = min(val, maximum)
     return val
@@ -101,7 +102,7 @@ def env_list(name: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
 
 class Config:
     BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-    OWNER_ID = env_int("OWNER_ID", 0, 1)
+    OWNER_ID = env_int("OWNER_ID", 0)
     MONGO_URI = os.getenv("MONGO_URI", "").strip()
     MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "telegram_downloader").strip()
 
@@ -116,7 +117,7 @@ class Config:
     YOUTUBE_LOG_CHANNEL_ID = env_int("YOUTUBE_LOG_CHANNEL_ID", OWNER_ID)
     INSTAGRAM_LOG_CHANNEL_ID = env_int("INSTAGRAM_LOG_CHANNEL_ID", OWNER_ID)
     TIKTOK_LOG_CHANNEL_ID = env_int("TIKTOK_LOG_CHANNEL_ID", OWNER_ID)
-    ADMIN_CHAT_ID = env_int("REPORT_CHAT_ID", OWNER_ID, 1)
+    ADMIN_CHAT_ID = env_int("REPORT_CHAT_ID", OWNER_ID)
 
     # Concurrency & Schedulers
     SOURCE_REFRESH_SECONDS = env_int("SOURCE_REFRESH_SECONDS", 300, 30)
