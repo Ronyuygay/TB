@@ -1527,7 +1527,7 @@ class WorkerScheduler:
         if meta.get("recovered"):
             status_line = f"recovered after quarantine ({meta.get('downtime_hours', 0.0)}h downtime)"
         lines = [
-            f"✅ WORKING — {platform.title()}",
+            f"âœ… WORKING â€” {platform.title()}",
             "```",
             f"proxy: {doc.get('proxy_url')}",
             f"country: {country}",
@@ -1551,7 +1551,7 @@ class WorkerScheduler:
                 for raw in unique_raw[:10]:
                     entry = parse_proxy_string(raw)
                     if not entry:
-                        results_summary.append(f"❌ `{raw}` — Invalid proxy string format")
+                        results_summary.append(f"âŒ `{raw}` â€” Invalid proxy string format")
                         continue
                     await self.db.upsert_proxy_to_platforms(entry, country=entry.source_country)
                     async def test_platform(platform: str):
@@ -1589,11 +1589,11 @@ class WorkerScheduler:
                                 failures.append(f"{pname.title()}: {res.get('error', 'failed')}")
                     proxy_masked = mask_proxy_string(entry.canonical)
                     if working_on:
-                        msg = f"✅ `{proxy_masked}` — Working on: {', '.join(working_on)}"
+                        msg = f"âœ… `{proxy_masked}` â€” Working on: {', '.join(working_on)}"
                         if failures:
                             msg += f" (Failed: {'; '.join(failures)})"
                     else:
-                        msg = f"❌ `{proxy_masked}` — Not working on any platform:\n  " + (("\n  ".join(failures)) or "No platform result.")
+                        msg = f"âŒ `{proxy_masked}` â€” Not working on any platform:\n  " + (("\n  ".join(failures)) or "No platform result.")
                     results_summary.append(msg)
             finally:
                 async with self.claim_lock:
@@ -1653,14 +1653,14 @@ class WorkerScheduler:
         stats = await self.db.get_platform_stats(platform)
         return "\n".join(
             [
-                f"📊 DAILY {platform.upper()} PROXY DIGEST",
+                f"ðŸ“Š DAILY {platform.upper()} PROXY DIGEST",
                 f"Date: {now_utc().strftime('%Y-%m-%d %H:%M UTC')}",
                 "",
-                f"🟢 Working: {stats['working']}",
-                f"🟠 Quarantined: {stats['quarantined']}",
-                f"🔴 Disabled: {stats['disabled']}",
-                f"🌐 Total: {stats['total']}",
-                f"⭐ Ever Working: {stats['ever_working']}",
+                f"ðŸŸ¢ Working: {stats['working']}",
+                f"ðŸŸ  Quarantined: {stats['quarantined']}",
+                f"ðŸ”´ Disabled: {stats['disabled']}",
+                f"ðŸŒ Total: {stats['total']}",
+                f"â­ Ever Working: {stats['ever_working']}",
             ]
         )
     async def discovery_scheduler_loop(self) -> None:
@@ -1703,16 +1703,16 @@ class ReportEngine:
                     interleaved.append(values[index])
         return "\n".join(interleaved).encode("utf-8")
     async def generate_daily_digest(self) -> str:
-        lines = ["📊 DAILY PROXY WORKER DIGEST", f"Date: {now_utc().strftime('%Y-%m-%d %H:%M UTC')}", ""]
+        lines = ["ðŸ“Š DAILY PROXY WORKER DIGEST", f"Date: {now_utc().strftime('%Y-%m-%d %H:%M UTC')}", ""]
         for platform in ALL_PLATFORMS:
             stats = await self.db.get_platform_stats(platform)
             lines.extend(
                 [
-                    f"• **{platform.title()}**:",
-                    f"   🟢 Working: {stats['working']}",
-                    f"   🟠 Quarantined: {stats['quarantined']}",
-                    f"   🔴 Disabled: {stats['disabled']}",
-                    f"   🌐 Total: {stats['total']}",
+                    f"â€¢ **{platform.title()}**:",
+                    f"   ðŸŸ¢ Working: {stats['working']}",
+                    f"   ðŸŸ  Quarantined: {stats['quarantined']}",
+                    f"   ðŸ”´ Disabled: {stats['disabled']}",
+                    f"   ðŸŒ Total: {stats['total']}",
                 ]
             )
         return "\n".join(lines)
@@ -1757,32 +1757,32 @@ class TelegramAdminUI:
         return InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("📺 YouTube", callback_data="panel_youtube"),
-                    InlineKeyboardButton("📸 Instagram", callback_data="panel_instagram"),
-                    InlineKeyboardButton("🎵 TikTok", callback_data="panel_tiktok"),
+                    InlineKeyboardButton("ðŸ“º YouTube", callback_data="panel_youtube"),
+                    InlineKeyboardButton("ðŸ“¸ Instagram", callback_data="panel_instagram"),
+                    InlineKeyboardButton("ðŸŽµ TikTok", callback_data="panel_tiktok"),
                 ],
                 [
-                    InlineKeyboardButton("📊 Daily Digest", callback_data="btn_digest"),
-                    InlineKeyboardButton("📁 Sources", callback_data="btn_sources"),
+                    InlineKeyboardButton("ðŸ“Š Daily Digest", callback_data="btn_digest"),
+                    InlineKeyboardButton("ðŸ“ Sources", callback_data="btn_sources"),
                 ],
                 [
-                    InlineKeyboardButton("➕ Add Source", callback_data="btn_add_source"),
-                    InlineKeyboardButton("⚡ Manual Priority Check", callback_data="btn_manual_prompt"),
+                    InlineKeyboardButton("âž• Add Source", callback_data="btn_add_source"),
+                    InlineKeyboardButton("âš¡ Manual Priority Check", callback_data="btn_manual_prompt"),
                 ],
-                [InlineKeyboardButton("🩺 Source Health", callback_data="btn_source_health")],
+                [InlineKeyboardButton("ðŸ©º Source Health", callback_data="btn_source_health")],
             ]
         )
     @staticmethod
     def platform_subpanel_markup(platform: str, enabled: bool) -> InlineKeyboardMarkup:
-        toggle_text = "⏸ Disable Platform" if enabled else "▶️ Enable Platform"
+        toggle_text = "â¸ Disable Platform" if enabled else "â–¶ï¸ Enable Platform"
         return InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("📥 Export Working (Fastest First)", callback_data=f"exp_{platform}")],
+                [InlineKeyboardButton("ðŸ“¥ Export Working (Fastest First)", callback_data=f"exp_{platform}")],
                 [
                     InlineKeyboardButton(toggle_text, callback_data=f"toggle_{platform}"),
-                    InlineKeyboardButton("♻️ Refresh Pool", callback_data=f"ref_{platform}"),
+                    InlineKeyboardButton("â™»ï¸ Refresh Pool", callback_data=f"ref_{platform}"),
                 ],
-                [InlineKeyboardButton("🔙 Back to Main Dashboard", callback_data="panel_main")],
+                [InlineKeyboardButton("ðŸ”™ Back to Main Dashboard", callback_data="panel_main")],
             ]
         )
     async def setup(self) -> None:
@@ -1801,7 +1801,7 @@ class TelegramAdminUI:
             if not self.is_authorized(message.from_user.id):
                 return
             await message.reply_text(
-                "🤖 **Proxy Worker Bot v3 (Multi-Platform)**\nSelect a platform panel below:",
+                "ðŸ¤– **Proxy Worker Bot v3 (Multi-Platform)**\nSelect a platform panel below:",
                 reply_markup=self.main_dashboard_markup(),
             )
         @self.bot.on_message(filters.command("addsource") & filters.private)
@@ -1820,7 +1820,7 @@ class TelegramAdminUI:
             else:
                 name, url = "Manual Source", spec
             if not url.startswith(("http://", "https://")):
-                await message.reply_text("❌ Source URL must start with http:// or https://")
+                await message.reply_text("âŒ Source URL must start with http:// or https://")
                 return
             source_id = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
             await self.db.upsert_source(
@@ -1835,7 +1835,7 @@ class TelegramAdminUI:
                 },
                 only_if_missing=True,
             )
-            await message.reply_text(f"✅ Source added: `{name or 'Manual Source'}`")
+            await message.reply_text(f"âœ… Source added: `{name or 'Manual Source'}`")
         @self.bot.on_message(filters.text & filters.private)
         async def _on_text(_, message: Message):
             if not self.is_authorized(message.from_user.id):
@@ -1848,7 +1848,7 @@ class TelegramAdminUI:
                 else:
                     name, url = "Manual Source", spec
                 if not url.startswith(("http://", "https://")):
-                    await message.reply_text("❌ Source URL must start with http:// or https://")
+                    await message.reply_text("âŒ Source URL must start with http:// or https://")
                     return
                 source_id = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
                 await self.db.upsert_source(
@@ -1863,7 +1863,7 @@ class TelegramAdminUI:
                     },
                     only_if_missing=True,
                 )
-                await message.reply_text(f"✅ Source added: `{name or 'Manual Source'}`")
+                await message.reply_text(f"âœ… Source added: `{name or 'Manual Source'}`")
         @self.bot.on_message(filters.command("addproxy") & filters.private)
         async def _cmd_addproxy(_, message: Message):
             if not self.is_authorized(message.from_user.id):
@@ -1873,7 +1873,7 @@ class TelegramAdminUI:
                 await message.reply_text("Usage: `/addproxy <proxy_url>` or paste multiple lines.")
                 return
             proxies = [p.strip() for p in parts[1].split() if p.strip()]
-            wait_msg = await message.reply_text("⚡ Pausing queue and executing manual priority check across platforms...")
+            wait_msg = await message.reply_text("âš¡ Pausing queue and executing manual priority check across platforms...")
             res = await self.scheduler.manual_priority_check(proxies)
             await wait_msg.edit_text(res)
         @self.bot.on_message(filters.command("digest") & filters.private)
@@ -1889,9 +1889,9 @@ class TelegramAdminUI:
                 return
             fname = message.document.file_name.lower()
             if not any(fname.endswith(f".{ext}") for ext in ("txt", "json", "csv")):
-                await message.reply_text("❌ Only .txt, .json, or .csv files are supported.")
+                await message.reply_text("âŒ Only .txt, .json, or .csv files are supported.")
                 return
-            wait_msg = await message.reply_text("📥 Downloading & ingesting proxy list...")
+            wait_msg = await message.reply_text("ðŸ“¥ Downloading & ingesting proxy list...")
             fpath = await message.download()
             try:
                 with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
@@ -1899,7 +1899,7 @@ class TelegramAdminUI:
                 candidates = parse_source_payload(raw_text, "", fname)
                 proxies = [c.raw for c in candidates]
                 res = await self.scheduler.manual_priority_check(proxies)
-                await wait_msg.edit_text(f"📁 Ingestion Summary for `{message.document.file_name}`:\n\n{res[:3800]}")
+                await wait_msg.edit_text(f"ðŸ“ Ingestion Summary for `{message.document.file_name}`:\n\n{res[:3800]}")
             finally:
                 if os.path.exists(fpath):
                     os.remove(fpath)
@@ -1911,21 +1911,21 @@ class TelegramAdminUI:
             data = query.data
             if data == "panel_main":
                 await query.message.edit_text(
-                    "🤖 **Proxy Worker Bot v3 (Multi-Platform)**\nSelect a platform panel below:",
+                    "ðŸ¤– **Proxy Worker Bot v3 (Multi-Platform)**\nSelect a platform panel below:",
                     reply_markup=self.main_dashboard_markup(),
                 )
             elif data.startswith("panel_"):
                 p = data.split("_")[1]
                 stats = await self.db.get_platform_stats(p)
                 enabled = await self.db.get_config(f"{p}_validation_enabled", True)
-                status_str = "🟢 Active" if enabled else "⏸ Paused"
+                status_str = "ðŸŸ¢ Active" if enabled else "â¸ Paused"
                 text = (
-                    f"**[{p.title()} Panel]** — Status: {status_str}\n\n"
-                    f"🟢 Working: `{stats['working']}`\n"
-                    f"🟠 Quarantined: `{stats['quarantined']}`\n"
-                    f"🔴 Disabled: `{stats['disabled']}`\n"
-                    f"🌐 Total Registered: `{stats['total']}`\n"
-                    f"⭐ Ever Validated Working: `{stats['ever_working']}`"
+                    f"**[{p.title()} Panel]** â€” Status: {status_str}\n\n"
+                    f"ðŸŸ¢ Working: `{stats['working']}`\n"
+                    f"ðŸŸ  Quarantined: `{stats['quarantined']}`\n"
+                    f"ðŸ”´ Disabled: `{stats['disabled']}`\n"
+                    f"ðŸŒ Total Registered: `{stats['total']}`\n"
+                    f"â­ Ever Validated Working: `{stats['ever_working']}`"
                 )
                 await query.message.edit_text(text, reply_markup=self.platform_subpanel_markup(p, enabled))
             elif data.startswith("exp_"):
@@ -1949,13 +1949,13 @@ class TelegramAdminUI:
                 # Refresh panel view
                 stats = await self.db.get_platform_stats(p)
                 enabled = not cur
-                status_str = "🟢 Active" if enabled else "⏸ Paused"
+                status_str = "ðŸŸ¢ Active" if enabled else "â¸ Paused"
                 text = (
-                    f"**[{p.title()} Panel]** — Status: {status_str}\n\n"
-                    f"🟢 Working: `{stats['working']}`\n"
-                    f"🟠 Quarantined: `{stats['quarantined']}`\n"
-                    f"🔴 Disabled: `{stats['disabled']}`\n"
-                    f"🌐 Total Registered: `{stats['total']}`"
+                    f"**[{p.title()} Panel]** â€” Status: {status_str}\n\n"
+                    f"ðŸŸ¢ Working: `{stats['working']}`\n"
+                    f"ðŸŸ  Quarantined: `{stats['quarantined']}`\n"
+                    f"ðŸ”´ Disabled: `{stats['disabled']}`\n"
+                    f"ðŸŒ Total Registered: `{stats['total']}`"
                 )
                 await query.message.edit_text(text, reply_markup=self.platform_subpanel_markup(p, enabled))
             elif data.startswith("ref_"):
@@ -1967,7 +1967,7 @@ class TelegramAdminUI:
                     {f"platform_status.{p}.state": PlatformState.WORKING},
                     {"$set": {f"platform_status.{p}.next_check_at": now_utc()}},
                 )
-                await query.message.reply_text(f"♻️ Immediate revalidation scheduled for all active {p.title()} proxies.")
+                await query.message.reply_text(f"â™»ï¸ Immediate revalidation scheduled for all active {p.title()} proxies.")
             elif data == "btn_add_source":
                 self._awaiting_source = True
                 await query.message.reply_text(
@@ -1981,9 +1981,9 @@ class TelegramAdminUI:
                 await query.message.edit_text(digest, reply_markup=self.main_dashboard_markup())
             elif data == "btn_sources":
                 sources = await self.db.get_sources()
-                lines = [f"📁 Configured Sources ({len(sources)}):"]
+                lines = [f"ðŸ“ Configured Sources ({len(sources)}):"]
                 for s in sources[:20]:
-                    status = "🟢" if s.get("enabled") else "⏸"
+                    status = "ðŸŸ¢" if s.get("enabled") else "â¸"
                     disc = " [Auto]" if s.get("discovered") else ""
                     score = safe_float(s.get("health_score"), 0.0)
                     lines.append(
@@ -1997,10 +1997,10 @@ class TelegramAdminUI:
                 )
             elif data == "btn_source_health":
                 sources = await self.reports.source_health()
-                lines = ["🩺 SOURCE HEALTH"]
+                lines = ["ðŸ©º SOURCE HEALTH"]
                 for s in sources[:20]:
                     lines.append(
-                        f"{'🟢' if s.get('enabled') else '⏸'} "
+                        f"{'ðŸŸ¢' if s.get('enabled') else 'â¸'} "
                         f"{s.get('name', s.get('source_id'))}: "
                         f"{safe_float(s.get('health_score'), 0.0):.1f}"
                     )
@@ -2084,10 +2084,10 @@ class Application:
         await self.health_server.start()
         # Startup Announcement
         start_msg = (
-            "🚀 **Proxy Worker Bot v3 Online**\n"
-            "• Platforms: YouTube, Instagram, TikTok\n"
-            "• Collections: 3 Isolated collections\n"
-            "• State Machine: Staged Revalidation Active"
+            "ðŸš€ **Proxy Worker Bot v3 Online**\n"
+            "â€¢ Platforms: YouTube, Instagram, TikTok\n"
+            "â€¢ Collections: 3 Isolated collections\n"
+            "â€¢ State Machine: Staged Revalidation Active"
         )
         await self.admin_ui.notify_platform("youtube", start_msg)
         logger.info("[APP] Initialization fully complete.")
