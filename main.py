@@ -1846,6 +1846,16 @@ class TelegramAdminUI:
                 await self.bot.send_message(target_channel, text)
             except Exception:
                 logger.exception("[TG] Retry send failed for %s", platform)
+        except (KeyError, ValueError) as e:
+            # Pyrogram MTProto Peer Resolution failure (common with in_memory=True and private channels)
+            # Fallback to direct Telegram HTTP Bot API which bypasses MTProto access_hash requirements.
+            try:
+                url = f"https://api.telegram.org/bot{Config.BOT_TOKEN}/sendMessage"
+                payload = {"chat_id": target_channel, "text": text, "parse_mode": "Markdown"}
+                async with aiohttp.ClientSession() as session:
+                    await session.post(url, json=payload)
+            except Exception as http_e:
+                logger.exception("[TG] HTTP fallback also failed for %s", platform)
         except Exception:
             logger.exception("[TG] Failed to dispatch alert to %s log channel", platform)
 
